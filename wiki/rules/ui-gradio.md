@@ -20,3 +20,14 @@ os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 ## [GRADIO-004] Долгие операции
 `gr.Progress()` в сигнатуре обработчика + текст «первый раз скачается N МБ» —
 иначе пользователь думает, что всё зависло.
+
+## [GRADIO-005] Автосохранение настроек
+`settings.json` рядом с app.py: `load_settings()` мёржит поверх DEFAULT_SETTINGS,
+`.change(autosave, inputs=cfg_inputs)` на каждом поле, значения при старте — из файла.
+Файл в .gitignore (может содержать API-ключ LiteLLM — предупреждать в README).
+При добавлении полей — не забыть `SETTING_FIELDS` (порядок = порядок inputs).
+
+## [GRADIO-006] Серверные события в UI — gr.Timer
+Фоновые потоки (wake word) не могут сами обновить браузер: кладут события в
+`queue.Queue`, а `gr.Timer(1.0).tick(...)` раз в секунду вычитывает и обновляет
+компоненты через `gr.skip()` для неизменных. Аудио с `autoplay=True` проиграется само.

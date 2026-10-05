@@ -1,10 +1,10 @@
 # Правила: локальные LLM и LiteLLM
 
-## [LLM-001] GGUF — с зеркал bartowski, не из официальных репо
-`Qwen/Qwen3-4B-Instruct-2507-GGUF` отдаёт 401 на прямое скачивание.
-Рабочие источники (проверены HEAD 200):
-- `bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF` → `...-Q4_K_M.gguf`
-- `bartowski/google_gemma-3-12b-it-GGUF` → `...-Q4_K_M.gguf`
+## [LLM-001] Модели не хардкодим; GGUF — с зеркал bartowski
+UI принимает любую GGUF: HF repo + filename или локальный путь (см. `load_llm(cfg)`).
+Дефолт в настройках: `bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF` (`...-Q4_K_M.gguf`).
+Официальный `Qwen/...-GGUF` отдаёт 401 на прямое скачивание — зеркала bartowski надёжнее.
+12B-класс: `bartowski/google_gemma-3-12b-it-GGUF` (проверено HEAD 200).
 
 ## [LLM-002] Системный промпт — «без markdown»
 Ответ озвучивается TTS: списки, эмодзи, `**`, ссылки читаются вслух как мусор.

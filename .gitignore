@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 .installed
+.installed-v2
+settings.json
 *.wav
 .DS_Store

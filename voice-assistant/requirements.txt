@@ -8,3 +8,4 @@ vosk
 llama-cpp-python
 huggingface_hub
 requests
+sounddevice
