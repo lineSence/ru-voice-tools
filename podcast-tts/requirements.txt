@@ -1,0 +1,6 @@
+# torch ставится лаунчером отдельно (CPU-сборка), не добавляйте его сюда
+gradio>=5.0
+omegaconf
+soundfile
+numpy
+scipy

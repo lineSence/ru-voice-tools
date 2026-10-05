@@ -1,0 +1,8 @@
+.venv/
+.test-venv/
+__pycache__/
+*.pyc
+*.pyo
+.installed
+*.wav
+.DS_Store
