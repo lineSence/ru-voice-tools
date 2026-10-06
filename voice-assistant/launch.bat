@@ -33,14 +33,14 @@ if not exist .venv\Scripts\python.exe (
 set "VENVPY=.venv\Scripts\python.exe"
 
 rem --- 3. Install dependencies (marker versioned, bump on new deps) --------
-if exist .venv\.installed-v3 goto RUN
+if exist .venv\.installed-v4 goto RUN
 echo Installing dependencies, first run takes 10-20 minutes...
 "%VENVPY%" -m pip install --upgrade pip --disable-pip-version-check
 "%VENVPY%" -m pip install torch --index-url https://download.pytorch.org/whl/cpu --disable-pip-version-check
 if errorlevel 1 goto FAIL
 "%VENVPY%" -m pip install -r requirements.txt --disable-pip-version-check
 if errorlevel 1 goto FAIL
-echo ok> .venv\.installed-v3
+echo ok> .venv\.installed-v4
 
 :RUN
 echo Starting GUI... A browser tab will open at http://127.0.0.1:7861

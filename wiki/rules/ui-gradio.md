@@ -19,13 +19,16 @@ os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 
 ## [GRADIO-004] Долгие операции
 `gr.Progress()` в сигнатуре обработчика + текст «первый раз скачается N МБ» —
-иначе пользователь думает, что всё зависло.
+иначе пользователь думает, что всё зависло. Исключение — вопрос ассистенту (`respond`): прогресс
+только на плеере (`show_progress_on=[reply]`, в старых Gradio — `show_progress="minimal"`), а ход
+работы виден в «Диалоге» ([GRADIO-008]).
 
 ## [GRADIO-005] Автосохранение настроек
 `settings.json` рядом с app.py: `load_settings()` мёржит поверх DEFAULT_SETTINGS,
 `.change(autosave, inputs=cfg_inputs)` на каждом поле, значения при старте — из файла.
 Файл в .gitignore (может содержать API-ключ LiteLLM — предупреждать в README).
-При добавлении полей — не забыть `SETTING_FIELDS` (порядок = порядок inputs).
+При добавлении полей — не забыть `SETTING_FIELDS` (порядок = порядок inputs; в v4 добавлены
+`system_prompt`, `max_tokens`, `web_search`). Миграции — по `settings_rev` в `load_settings()`.
 Баг 2026-10-05: галочка wake word не входила в `SETTING_FIELDS` и не сохранялась —
 теперь там же `wake_enabled` и `wake_device`; при старте с галочкой слушатель запускается сам.
 
@@ -41,3 +44,11 @@ wake word заглушён (`MUTE_UNTIL`), иначе ассистент усл�
 ## [GRADIO-007] Playwright-тесты GUI
 `page.goto(..., wait_until="load")` + ожидание нужного элемента. `networkidle` не наступает
 никогда: таймер опрашивает сервер каждые 0,5 с.
+
+## [GRADIO-008] Ответ «вживую» в «Диалоге»
+`respond()` блокирует обработчик до конца ответа, поэтому текст по мере генерации идёт не через
+yield, а через общий `LIVE` (вопрос, частичный ответ, статус «🌐 Ищу в интернете…») — его рисует
+`render_log()` по таймеру `poll_ui`, как и ответы wake word. Ошибка дописывается в лог с ⚠️,
+а `gr.skip()` в поле вопроса сохраняет набранный текст. Пресеты промпта — `button.click(lambda p=preset: p,
+outputs=[system_prompt])`, сохранение — обычным `.change(autosave)`.
+Playwright: `tests/test_gui_e2e_v4.py` + `tests/gui_server.py` (17 проверок, скриншоты).

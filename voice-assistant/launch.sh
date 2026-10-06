@@ -11,12 +11,12 @@ if [ ! -x .venv/bin/python ]; then
   "$PY" -m venv .venv
 fi
 
-if [ ! -f .venv/.installed-v3 ]; then
+if [ ! -f .venv/.installed-v4 ]; then
   echo "Installing dependencies, first run takes 10-20 minutes..."
   .venv/bin/python -m pip install --upgrade pip --disable-pip-version-check
   .venv/bin/python -m pip install torch --index-url https://download.pytorch.org/whl/cpu --disable-pip-version-check
   .venv/bin/python -m pip install -r requirements.txt --disable-pip-version-check
-  touch .venv/.installed-v3
+  touch .venv/.installed-v4
 fi
 
 echo "Starting GUI... A browser tab will open at http://127.0.0.1:7861"

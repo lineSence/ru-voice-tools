@@ -1,11 +1,12 @@
 # torch ставится лаунчером отдельно (CPU-сборка), не добавляйте его сюда
-gradio>=5.0
+gradio>=5.0,<7
 omegaconf
 soundfile
 numpy
 scipy
 vosk
 num2words
+ddgs>=9.16,<10
 huggingface_hub
 requests
 sounddevice

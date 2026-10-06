@@ -23,13 +23,18 @@ KoboldCpp на видеокарте через Vulkan, при любой про�
 Микрофон браузера (gr.Audio) ──→ Whisper (или Vosk, если выбран / Whisper недоступен)
 Текстовый ввод ────────────────→ user_text
                               ↓
-        LLM: локальная GGUF через KoboldCpp (/v1/chat/completions) ИЛИ LiteLLM (OpenAI-compatible POST)
-        system-промпт: коротко, без markdown/эмодзи; <think>…</think> вырезается ([LLM-006])
+        think_answer: system = промпт пользователя + TIME_RULE + правило поиска ([LLM-002], [WEB-001]);
+        вопрос = "[Сейчас …]\n" + user_text ([LLM-007]); fit_messages под n_ctx ([LLM-005])
                               ↓
-        clean_for_tts: латиница → кириллица (MIDI → миди, USB → ю-эс-би), числа → слова (num2words)
-                              ↓
-        Silero v5_ru (CPU) → WAV → gr.Audio (autoplay) / колонки (sounddevice)
-        История: gr.State, последние 6 пар реплик
+        LLM потоком (SSE): KoboldCpp /v1/chat/completions ИЛИ LiteLLM; <think> режется на лету ([LLM-008])
+          └─ ответ начался с "ПОИСК: q" (или «найди…») → поток прерван (/api/extra/abort)
+             → ddgs: все поисковики параллельно + текст 3 страниц ([WEB-003], [WEB-004])
+             → второй проход LLM с результатами (тот же префикс — кэш KoboldCpp)
+                              ↓ (куски текста)
+        LIVE → «Диалог» в GUI (gr.Timer 0,5 с)      SpeechStream: предложения → clean_for_tts
+                                                     (латиница/числа → слова) → Silero (фоновый поток)
+                                                     → колонки сразу (wake word) / один WAV (браузер)
+        История: HISTORY (последние 6 пар; вопрос с датой + shown + заметка о поиске/лимите)
 ```
 
 ### Движок KoboldCpp (порт 5011, только 127.0.0.1)

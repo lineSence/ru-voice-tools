@@ -9,7 +9,11 @@ LLM          : любая GGUF (Hugging Face repo+file или локальный
                либо OpenAI-совместимый endpoint (LiteLLM-прокси)
 Движок       : KoboldCpp (скачивается сам) — LLM и Whisper на видеокарте через Vulkan
                (AMD/NVIDIA/Intel, CUDA не нужна) или на процессоре
-TTS          : Silero v5; английские слова и числа переводятся в русское чтение
+TTS          : Silero v5; английские слова и числа переводятся в русское чтение;
+               ответ звучит по предложениям, пока модель ещё дописывает остальное
+Поиск        : Google, DuckDuckGo, Yahoo, Brave… (пакет ddgs, без ключей) — модель сама решает,
+               когда нужен интернет, или ищет по просьбе «найди…»
+Промпт       : системный промпт и длина ответа редактируются в GUI
 Wake word    : Vosk слушает микрофон компьютера и ищет слово-триггер, сам вопрос
                дораспознаёт Whisper
 
@@ -30,6 +34,7 @@ import difflib
 import hashlib
 import inspect
 import io
+import itertools
 import json
 import math
 import platform
@@ -40,6 +45,10 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait
+from html import unescape as html_unescape
 
 import numpy as np
 import soundfile as sf
@@ -61,6 +70,39 @@ STT_VOSK = "Vosk — быстрее, только русские слова"
 COMPUTE_GPU = "Видеокарта (Vulkan)"
 COMPUTE_CPU = "Только процессор"
 DEFAULT_DEVICE = "Системный по умолчанию"
+WEB_AUTO = "Автоматически — модель решает сама"
+WEB_ASK = "Только когда прошу («найди», «поищи в интернете»)"
+WEB_OFF = "Выключен"
+WEB_MODES = [WEB_AUTO, WEB_ASK, WEB_OFF]
+
+PROMPT_SHORT = (
+    "Ты — дружелюбный русскоязычный голосовой помощник. "
+    "Отвечай коротко: одно-три предложения, простым разговорным языком. "
+    "Никаких списков, markdown, эмодзи, скобок и ссылок — ответ будет зачитан вслух. "
+    "Если вопрос непонятен, вежливо переспроси."
+)
+PROMPT_BALANCED = (
+    "Ты — дружелюбный русскоязычный голосовой помощник, твои ответы зачитываются вслух. "
+    "Подбирай длину ответа под вопрос: на простой вопрос отвечай коротко, в одно-три "
+    "предложения; если просят объяснить, рассказать подробно, дать инструкцию или совет "
+    "или вопрос сложный — отвечай развёрнуто, по шагам и с пояснениями. "
+    "Пиши обычным разговорным текстом без markdown, таблиц, эмодзи и ссылок; вместо "
+    "списков связывай шаги словами «сначала», «затем», «в конце». "
+    "Если вопрос непонятен, вежливо переспроси."
+)
+PROMPT_DETAILED = (
+    "Ты — внимательный русскоязычный помощник-эксперт, твои ответы зачитываются вслух. "
+    "Отвечай подробно и обстоятельно: объясняй причины, приводи примеры, давай пошаговые "
+    "инструкции и практические советы, предупреждай о типичных ошибках. "
+    "Пиши связным разговорным текстом без markdown, таблиц, эмодзи и ссылок; шаги "
+    "называй словами «во-первых», «во-вторых», «затем». "
+    "Если вопрос неоднозначен, коротко уточни, что имеется в виду."
+)
+PROMPT_PRESETS = {"Коротко": PROMPT_SHORT, "Сбалансированно (стандарт)": PROMPT_BALANCED,
+                  "Подробно": PROMPT_DETAILED}
+DEFAULT_SYSTEM_PROMPT = PROMPT_BALANCED
+DEFAULT_MAX_TOKENS = 1024
+SETTINGS_REV = 2  # 2: n_ctx 4096 -> 8192, системный промпт, длина ответа, поиск
 
 WHISPER_REPO = "ggerganov/whisper.cpp"
 WHISPER_MODELS = [
@@ -85,7 +127,7 @@ DEFAULT_SETTINGS = {
     "litellm_base": "http://127.0.0.1:4000/v1",
     "litellm_key": "",
     "litellm_model": "",
-    "n_ctx": 4096,
+    "n_ctx": 8192,
     "wake_enabled": False,
     "wake_word": "ассистент",
     "wake_device": DEFAULT_DEVICE,
@@ -95,17 +137,44 @@ DEFAULT_SETTINGS = {
     "whisper_prompt": DEFAULT_WHISPER_PROMPT,
     "gpu_layers": -1,
     "kobold_path": "",  # необязательно: свой koboldcpp(.exe) вместо скачиваемого
+    "system_prompt": DEFAULT_SYSTEM_PROMPT,
+    "max_tokens": DEFAULT_MAX_TOKENS,
+    "web_search": WEB_AUTO,
+    "settings_rev": SETTINGS_REV,
 }
 
-SYSTEM_PROMPT = (
-    "Ты — дружелюбный русскоязычный голосовой помощник. "
-    "Отвечай коротко: одно-три предложения, простым разговорным языком. "
-    "Никаких списков, markdown, эмодзи, скобок и ссылок — ответ будет зачитан вслух. "
-    "Если вопрос непонятен, вежливо переспроси."
+# Добавляется к системному промпту пользователя автоматически (не редактируется в GUI)
+TIME_RULE = ("В начале сообщений пользователя в квадратных скобках указаны текущие дата и время — "
+             "учитывай их, когда это важно, но не упоминай без надобности.")
+SEARCH_RULE_AUTO = (
+    "У тебя есть поиск в интернете. Если для точного ответа нужны свежие или проверяемые "
+    "сведения — новости, погода, курсы валют, цены, расписания, результаты матчей, недавние "
+    "события, актуальные версии программ, факты о конкретных людях, компаниях и товарах — "
+    "или пользователь просит поискать, не отвечай сам, а напиши ровно одну строку:\n"
+    "ПОИСК: короткий поисковый запрос\n"
+    "и больше ничего. Если поиск не нужен (беседа, объяснение общих понятий, советы, "
+    "расчёты, творческие задачи), отвечай сразу."
+)
+SEARCH_RULE_ASK = (
+    "У тебя есть поиск в интернете, но используй его, только если пользователь прямо просит "
+    "найти или поискать что-то в интернете. Тогда напиши ровно одну строку:\n"
+    "ПОИСК: короткий поисковый запрос\n"
+    "и больше ничего. В остальных случаях отвечай сразу сам. Если для точного ответа нужны "
+    "свежие сведения (погода, курсы, новости, цены), не выдумывай их: скажи, что точных "
+    "данных у тебя нет, и предложи попросить тебя поискать в интернете."
+)
+SEARCH_RESULTS_MSG = (
+    "Результаты поиска в интернете по запросу «{query}»:\n\n{results}\n\n"
+    "Ответь на мой вопрос «{question}», опираясь на эти результаты. Если ответа в них нет, "
+    "так и скажи и ответь по своим знаниям, предупредив, что сведения могут быть неточными. "
+    "Адреса сайтов не зачитывай. Поиск больше не нужен — отвечай сразу."
+)
+SEARCH_FAILED_MSG = (
+    "Поиск в интернете не удался ({error}). Ответь на мой вопрос «{question}» по своим "
+    "знаниям и коротко предупреди, что сведения могут быть устаревшими. Поиск больше не нужен."
 )
 
-MAX_TOKENS = 220
-HISTORY_KEEP = 6  # пар реплик
+HISTORY_KEEP = 6  # пар реплик (меньше, если не влезают в контекст модели)
 
 _stt = {"model": None}
 _tts = {"model": None}
@@ -113,6 +182,7 @@ _tts = {"model": None}
 HISTORY = []
 HISTORY_VER = [0]  # растёт при каждом изменении диалога — таймер GUI видит новое
 HISTORY_LOCK = threading.Lock()
+LIVE = {"user": "", "text": "", "status": ""}  # ответ, который сейчас пишется (виден в «Диалоге»)
 PIPE_LOCK = threading.Lock()
 
 
@@ -126,12 +196,23 @@ def _int(v, default):
 
 
 def load_settings():
-    s = dict(DEFAULT_SETTINGS)
+    s, raw = dict(DEFAULT_SETTINGS), {}
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as f:
-            s.update(json.load(f))
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            raw = loaded
+            s.update(raw)
     except Exception:
         pass
+    if raw and _int(raw.get("settings_rev"), 1) < 2 and _int(raw.get("n_ctx"), 4096) == 4096:
+        s["n_ctx"] = 8192  # старый стандарт 4096: длинный ответ + результаты поиска не влезали
+    s["settings_rev"] = SETTINGS_REV
+    if s.get("web_search") not in WEB_MODES:
+        s["web_search"] = WEB_AUTO
+    s["max_tokens"] = max(64, min(8192, _int(s.get("max_tokens"), DEFAULT_MAX_TOKENS)))
+    if not isinstance(s.get("system_prompt"), str):
+        s["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     if s.get("stt_engine") not in (STT_WHISPER, STT_VOSK):
         s["stt_engine"] = STT_WHISPER
     if s.get("compute") not in (COMPUTE_GPU, COMPUTE_CPU):
@@ -148,24 +229,47 @@ def save_settings(s):
         pass
 
 
-def history_snapshot():
+def history_for_llm():
+    """История для модели: только role и content (лишние ключи API может не принять)."""
     with HISTORY_LOCK:
-        return list(HISTORY)
+        return [{"role": m["role"], "content": m["content"]} for m in HISTORY]
 
 
-def history_append(user_text, answer):
+def history_append(user_text, answer, sent=None, note=""):
+    """sent — вопрос в том виде, в каком ушёл модели (с датой): так кэш промпта в
+    KoboldCpp совпадает и на следующем вопросе старая часть диалога не пересчитывается."""
     with HISTORY_LOCK:
-        HISTORY.append({"role": "user", "content": user_text})
-        HISTORY.append({"role": "assistant", "content": answer})
+        HISTORY.append({"role": "user", "content": sent or user_text, "shown": user_text})
+        HISTORY.append({"role": "assistant", "content": answer, "note": note})
         del HISTORY[:-HISTORY_KEEP * 2]
+        LIVE.update(user="", text="", status="")
+        HISTORY_VER[0] += 1
+
+
+def live_update(**kv):
+    """Ответ в процессе: текст по мере генерации и что сейчас происходит (поиск…)."""
+    with HISTORY_LOCK:
+        LIVE.update(kv)
         HISTORY_VER[0] += 1
 
 
 def render_log():
-    return "\n".join(
-        ("Вы: " if m["role"] == "user" else "Ассистент: ") + m["content"]
-        for m in history_snapshot()
-    )
+    with HISTORY_LOCK:
+        hist, live = list(HISTORY), dict(LIVE)
+    lines = []
+    for m in hist:
+        if m["role"] == "user":
+            lines.append("Вы: " + m.get("shown", m["content"]))
+        else:
+            lines.append("Ассистент: " + m["content"])
+            if m.get("note"):
+                lines.append("   " + m["note"])
+    if live["user"]:
+        lines.append("Вы: " + live["user"])
+        lines.append("Ассистент: " + (live["text"] or "…"))
+    if live["status"]:
+        lines.append("   " + live["status"])
+    return "\n".join(lines)
 
 
 # ----------------------------- STT (Vosk) ----------------------------------
@@ -732,12 +836,12 @@ def ensure_engine(cfg):
             raise
 
 
-def engine_post(cfg, path, payload, timeout):
-    """POST в KoboldCpp; если он упал — один перезапуск и повтор."""
+def engine_request(cfg, path, payload, timeout, stream=False):
+    """POST в KoboldCpp -> Response; если он упал — один перезапуск и повтор."""
     for attempt in (1, 2):
         base = ensure_engine(cfg)
         try:
-            r = _HTTP.post(base + path, json=payload, timeout=timeout)
+            r = _HTTP.post(base + path, json=payload, timeout=timeout, stream=stream)
         except (requests.ConnectionError, requests.exceptions.ChunkedEncodingError):
             proc = _eng["proc"]
             if attempt == 2 or (proc is not None and proc.poll() is None):
@@ -745,8 +849,14 @@ def engine_post(cfg, path, payload, timeout):
             engine_report(phase="error", info="KoboldCpp упал — перезапускаю…")
             continue
         if r.status_code != 200:
-            raise EngineError(f"KoboldCpp вернул ошибку {r.status_code}: {r.text[:200]}")
-        return r.json()
+            text = r.text[:200]
+            r.close()
+            raise EngineError(f"KoboldCpp вернул ошибку {r.status_code}: {text}")
+        return r
+
+
+def engine_post(cfg, path, payload, timeout):
+    return engine_request(cfg, path, payload, timeout).json()
 
 
 def engine_bg(restart=False):
@@ -825,11 +935,63 @@ def transcribe(audio_path, cfg=None):
 
 # ----------------------------- LLM ------------------------------------------
 
-def build_messages(history, user_text):
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    msgs.extend(history[-HISTORY_KEEP * 2:])
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
+RU_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота",
+               "воскресенье"]
+RU_MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+             "сентября", "октября", "ноября", "декабря"]
+CHARS_PER_TOKEN = 2.5  # русский текст у Qwen ≈ 2,7 символа на токен (замерено) — с запасом
+
+
+def now_line(t=None):
+    t = time.localtime(t)
+    return (f"Сейчас {RU_WEEKDAYS[t.tm_wday]}, {t.tm_mday} {RU_MONTHS[t.tm_mon - 1]} "
+            f"{t.tm_year} года, {t.tm_hour}:{t.tm_min:02d}.")
+
+
+def est_tokens(text):
+    return int(len(text or "") / CHARS_PER_TOKEN) + 4
+
+
+def build_system(cfg):
+    """Системный промпт пользователя + автоматические правила (дата, поиск)."""
+    text = (cfg.get("system_prompt") or "").strip() or DEFAULT_SYSTEM_PROMPT
+    text += "\n\n" + TIME_RULE
+    if cfg.get("web_search") == WEB_AUTO:
+        text += "\n\n" + SEARCH_RULE_AUTO
+    elif cfg.get("web_search") == WEB_ASK:
+        text += "\n\n" + SEARCH_RULE_ASK
+    return {"role": "system", "content": text}
+
+
+def fit_messages(cfg, system, history, tail, max_tokens):
+    """Сообщения, которые влезают в контекст локальной модели: старые реплики выкидываются
+    (иначе KoboldCpp сам отрежет НАЧАЛО — системный промпт), слишком длинное сообщение
+    в хвосте (результаты поиска) подрезается в середине. -> (messages, max_tokens)"""
+    tail = list(tail)
+    if cfg.get("llm_source") == SRC_LITELLM:
+        return [system] + history[-HISTORY_KEEP * 2:] + tail, max_tokens
+    n_ctx = _int(cfg.get("n_ctx"), 8192)
+    max_tokens = max(64, min(max_tokens, n_ctx // 2))
+    budget = n_ctx - max_tokens - 64
+
+    def cost(msgs):
+        return sum(est_tokens(m["content"]) for m in msgs)
+
+    used = cost([system] + tail)
+    if used > budget and tail:
+        i = max(range(len(tail)), key=lambda k: len(tail[k]["content"]))
+        c = tail[i]["content"]
+        cut = int((used - budget) * CHARS_PER_TOKEN) + 100
+        if len(c) - cut > 600:
+            tail[i] = dict(tail[i], content=c[:len(c) - cut - 400] + " … " + c[-400:])
+        used = cost([system] + tail)
+    keep = []
+    for k in range(len(history) - 2, -1, -2):  # с конца, парами «вопрос — ответ»
+        pair = history[k:k + 2]
+        if used + cost(pair) > budget or len(keep) >= HISTORY_KEEP * 2:
+            break
+        keep, used = pair + keep, used + cost(pair)
+    return [system] + keep + tail, max_tokens
 
 
 def strip_think(text):
@@ -839,34 +1001,571 @@ def strip_think(text):
     return text.strip()
 
 
-def answer_local(cfg, messages):
-    """GGUF через KoboldCpp (видеокарта по Vulkan или процессор)."""
-    ensure_engine(cfg)
-    t0 = time.time()
-    data = engine_post(cfg, "/v1/chat/completions", {
-        "messages": messages, "max_tokens": MAX_TOKENS, "temperature": 0.6}, timeout=600)
-    dt, tps = time.time() - t0, None
-    try:  # скорость генерации без учёта чтения промпта
-        tps = _HTTP.get(ENGINE_BASE + "/api/extra/perf", timeout=2).json().get("last_eval_speed")
-    except (requests.RequestException, ValueError):
-        pass
-    ENGINE_STATE.update(llm_sec=dt, llm_tps=tps or None)
-    return strip_think(data["choices"][0]["message"].get("content") or "")
+class ThinkFilter:
+    """Поток ответа без рассуждений «думающих» моделей (<think>…</think> в начале)."""
+
+    def __init__(self):
+        self.buf, self.mode = "", "start"  # start -> think -> lead -> pass
+
+    def feed(self, piece):
+        if self.mode == "pass":
+            return piece
+        if self.mode == "lead":  # пробелы и переносы сразу после </think> не нужны
+            piece = piece.lstrip()
+            if piece:
+                self.mode = "pass"
+            return piece
+        self.buf += piece
+        if self.mode == "start":
+            head = self.buf.lstrip()
+            if head.startswith("<think>"):
+                self.mode = "think"
+            elif "<think>".startswith(head):
+                return ""  # пока пусто или начало тега — ждём
+            else:
+                self.mode, out, self.buf = "pass", self.buf, ""
+                return out
+        end = self.buf.find("</think>")
+        if end < 0:
+            return ""
+        out, self.buf = self.buf[end + 8:].lstrip(), ""
+        self.mode = "pass" if out else "lead"
+        return out
+
+    def flush(self):
+        out, self.buf = ("" if self.mode == "think" else self.buf), ""
+        return out
 
 
-def answer_litellm(cfg, messages):
-    base, model_name = cfg["litellm_base"].strip(), cfg["litellm_model"].strip()
-    if not base or not model_name:
-        raise RuntimeError("Заполните Base URL и имя модели в настройках LiteLLM.")
-    r = requests.post(
-        base.rstrip("/") + "/chat/completions",
-        headers={"Authorization": f"Bearer {cfg['litellm_key']}"} if cfg["litellm_key"] else {},
-        json={"model": model_name, "messages": messages,
-              "max_tokens": MAX_TOKENS, "temperature": 0.6},
-        timeout=180,
-    )
+SEARCH_CMD_RE = re.compile(r"^\W*(?:поиск|search)\b[\s*]*(?::|\])[\s*:]*", re.I)
+
+
+def _cmd_pending(text):
+    """Начало строки ещё может оказаться командой «ПОИСК:» — подождать продолжения."""
+    head = re.sub(r"^\W+", "", text).lower()
+    if not head:
+        return len(text) < 12
+    if len(head) > 12:
+        return False
+    return ("поиск".startswith(head) or "search".startswith(head)
+            or bool(re.fullmatch(r"(?:поиск|search)[\s*\]]*", head)))
+
+
+class CommandSniffer:
+    """Ищет в начале ответа строку «ПОИСК: запрос» (просьба модели поискать в интернете).
+    Текст до неё отдаётся как обычный ответ («Сейчас поищу.»), сама команда — нет."""
+    LIMIT = 300  # дальше начала ответа команду не ищем
+
+    def __init__(self):
+        self.buf, self.state, self.seen = "", "linestart", 0  # linestart | inline | cmd | pass
+        self.query, self.done = "", False
+
+    def feed(self, piece):
+        if self.done:
+            return ""
+        if self.state == "pass":
+            return piece
+        out = []
+        self.buf += piece
+        while self.buf:
+            if self.state == "inline":
+                head, nl, rest = self.buf.partition("\n")
+                out.append(head + nl)
+                self.seen += len(head + nl)
+                self.buf = rest
+                if not nl:
+                    break
+                if self.seen > self.LIMIT:
+                    self.state = "pass"
+                    out.append(self.buf)
+                    self.buf = ""
+                    break
+                self.state = "linestart"
+                continue
+            if self.state == "cmd":
+                q, nl, _ = self.buf.lstrip().partition("\n")
+                if (nl and q.strip()) or len(self.buf) > 300:
+                    self.query, self.done, self.buf = q, True, ""
+                break
+            m = SEARCH_CMD_RE.match(self.buf)
+            if m:
+                self.state, self.buf = "cmd", self.buf[m.end():]
+                continue
+            if _cmd_pending(self.buf):
+                break
+            self.state = "inline"
+        return "".join(out)
+
+    def finish(self):
+        """Конец потока -> остаток текста ответа."""
+        if self.state == "cmd" and not self.done:
+            self.query, self.done, self.buf = self.buf.lstrip().partition("\n")[0], True, ""
+        out, self.buf = ("" if self.done else self.buf), ""
+        return out
+
+
+def _norm_query(q):
+    q = re.sub(r"[*_`«»\"]", " ", q or "")
+    return re.sub(r"\s+", " ", q).strip(" .,:;!?—-[]()")[:200]
+
+
+SEARCH_ASK_RE = re.compile(
+    r"\b(?:найди|найти|поищи|поищем|поискать|погугли|загугли|пробей)\b"
+    r"|\b(?:в|по)\s+(?:интернете?|сети|гугле|яндексе)\b", re.I)
+
+
+def clean_query(text):
+    """Запрос для поиска из просьбы «найди в интернете, …»."""
+    q = re.sub(r"\b(?:пожалуйста|найди|найти|поищи|поищем|поискать|погугли|загугли|пробей|"
+               r"посмотри|узнай|мне|нам)\b", " ", text, flags=re.I)
+    q = re.sub(r"\b(?:в|по)\s+(?:интернете?|сети|гугле|яндексе)\b", " ", q, flags=re.I)
+    q = re.sub(r"\s+", " ", q).strip(" ,.;:!?—-")
+    return q or text.strip()
+
+
+LAST_FINISH = {"reason": None}  # почему модель закончила последний ответ: stop / length
+
+
+def _sse_pieces(resp):
+    for raw in resp.iter_lines():
+        if not raw or not raw.startswith(b"data:"):
+            continue
+        data = raw[5:].strip()
+        if data == b"[DONE]":
+            return
+        try:
+            choice = (json.loads(data).get("choices") or [{}])[0]
+        except (ValueError, AttributeError):
+            continue
+        if choice.get("finish_reason"):
+            LAST_FINISH["reason"] = choice["finish_reason"]
+        piece = (choice.get("delta") or {}).get("content") or choice.get("text") or ""
+        if piece:
+            yield piece
+
+
+def llm_stream(cfg, messages, max_tokens):
+    """Ответ LLM кусочками (SSE). Закрытие генератора останавливает генерацию."""
+    payload = {"messages": messages, "max_tokens": max_tokens, "temperature": 0.6,
+               "stream": True}
+    local = cfg.get("llm_source") != SRC_LITELLM
+    if local:
+        r = engine_request(cfg, "/v1/chat/completions", payload, timeout=(10, 900), stream=True)
+    else:
+        base, model_name = cfg["litellm_base"].strip(), cfg["litellm_model"].strip()
+        if not base or not model_name:
+            raise RuntimeError("Заполните Base URL и имя модели в настройках LiteLLM.")
+        r = requests.post(
+            base.rstrip("/") + "/chat/completions",
+            headers={"Authorization": f"Bearer {cfg['litellm_key']}"} if cfg["litellm_key"] else {},
+            json=dict(payload, model=model_name), timeout=(15, 300), stream=True)
+        if r.status_code != 200:
+            text = r.text[:200]
+            r.close()
+            raise RuntimeError(f"LiteLLM вернул ошибку {r.status_code}: {text}")
+    done, LAST_FINISH["reason"] = False, None
+    try:
+        if "event-stream" not in r.headers.get("content-type", ""):
+            data = r.json()  # сервер не умеет поток — весь ответ сразу
+            LAST_FINISH["reason"] = data["choices"][0].get("finish_reason")
+            yield data["choices"][0]["message"].get("content") or ""
+        else:
+            yield from _sse_pieces(r)
+        done = True
+    except (requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+        raise EngineError("Модель оборвала ответ — "
+                          + ("см. engine/koboldcpp.log" if local else str(e)[:150]))
+    finally:
+        r.close()
+        if local and not done:  # иначе KoboldCpp допишет ненужный ответ до конца
+            try:
+                _HTTP.post(ENGINE_BASE + "/api/extra/abort", json={}, timeout=3)
+            except requests.RequestException:
+                pass
+
+
+def stream_text(cfg, messages, max_tokens):
+    """llm_stream + один повтор, если локальный движок упал до первого слова."""
+    for attempt in (1, 2):
+        got, gen = False, llm_stream(cfg, messages, max_tokens)
+        try:
+            for piece in gen:
+                got = True
+                yield piece
+            return
+        except EngineError:
+            proc = _eng["proc"]
+            if (got or attempt == 2 or cfg.get("llm_source") == SRC_LITELLM
+                    or (proc is not None and proc.poll() is None)):
+                raise
+            engine_report(phase="error", info="KoboldCpp упал — перезапускаю…")
+        finally:
+            gen.close()
+
+
+def _stream_answer(cfg, messages, max_tokens, emit, sniff=True, force_search=False):
+    """Поток одного ответа -> (текст, запрос поиска или None). emit(кусок) — текст ответа.
+    force_search: пользователь просил найти, а модель начала отвечать сама — прервать."""
+    think, cmd, parts = ThinkFilter(), (CommandSniffer() if sniff else None), []
+    gen = stream_text(cfg, messages, max_tokens)
+    try:
+        for piece in gen:
+            out = think.feed(piece)
+            if cmd:
+                out = cmd.feed(out)
+                if cmd.done:
+                    return "".join(parts), cmd.query
+                if force_search and out and not parts:
+                    return "", ""
+            if out:
+                parts.append(out)
+                emit(out)
+        out = think.flush()
+        if cmd:
+            out = cmd.feed(out) + cmd.finish()
+            if cmd.done:
+                return "".join(parts), cmd.query
+            if force_search and out.strip() and not parts:
+                return "", ""
+        if out:
+            parts.append(out)
+            emit(out)
+        return "".join(parts), None
+    finally:
+        gen.close()
+
+
+def search_budget(cfg, system, sent, max_tokens):
+    """Сколько символов результатов поиска отдать модели (чтение промпта тоже не бесплатно)."""
+    if cfg.get("llm_source") == SRC_LITELLM:
+        return 8000
+    n_ctx = _int(cfg.get("n_ctx"), 8192)
+    mt = max(64, min(max_tokens, n_ctx // 2))
+    free = (n_ctx - mt - 64 - est_tokens(system["content"]) - est_tokens(sent) - 250
+            - min(1200, n_ctx // 6))
+    cap = 6000 if cfg.get("compute") != COMPUTE_CPU else 3000
+    return int(max(1200, min(cap, free * CHARS_PER_TOKEN)))
+
+
+def think_answer(user_text, cfg, emit=lambda s: None, status=lambda s: None):
+    """Ответ LLM, при необходимости — с поиском в интернете.
+    emit(кусок) — текст ответа по мере генерации; status(строка) — что сейчас происходит.
+    -> (ответ, вопрос в том виде, как ушёл модели, заметка о поиске)"""
+    mode = cfg.get("web_search", WEB_OFF)
+    max_tok = _int(cfg.get("max_tokens"), DEFAULT_MAX_TOKENS)
+    system, history = build_system(cfg), history_for_llm()
+    sent = f"[{now_line()}]\n{user_text}"
+    question = [{"role": "user", "content": sent}]
+    t0, note = time.time(), ""
+    use_tool = mode in (WEB_AUTO, WEB_ASK)
+    msgs, mt = fit_messages(cfg, system, history, question, max_tok)
+    answer, query = _stream_answer(cfg, msgs, mt, emit, sniff=use_tool,
+                                   force_search=use_tool and bool(SEARCH_ASK_RE.search(user_text)))
+    ENGINE_STATE["search_sec"] = None
+    if query is not None:
+        query = _norm_query(query) or clean_query(user_text)
+        status(f"🌐 Ищу в интернете: «{query}»")
+        ts = time.time()
+        try:
+            found, urls = web_search(query, search_budget(cfg, system, sent, mt))
+            results_msg = SEARCH_RESULTS_MSG.format(query=query, results=found, question=user_text)
+            note = f"🔎 Искал в интернете «{query}»: " + ", ".join(_domain(u) for u in urls[:4])
+        except Exception as e:
+            print(f"[search] {query}: {e}", flush=True)
+            results_msg = SEARCH_FAILED_MSG.format(error=str(e)[:150], question=user_text)
+            note = f"⚠️ Поиск «{query}» не удался: {str(e)[:150]}"
+        ENGINE_STATE["search_sec"] = time.time() - ts
+        print(f"[search] {ENGINE_STATE['search_sec']:.1f} с: {note}", flush=True)
+        status("📖 Читаю найденное…")
+        tail = question + [{"role": "assistant", "content": f"ПОИСК: {query}"},
+                           {"role": "user", "content": results_msg}]
+        msgs, mt = fit_messages(cfg, system, history, tail, max_tok)
+        answer, again = _stream_answer(cfg, msgs, mt, emit, sniff=True)
+        if again is not None:  # снова просит поиск — ответ без правила поиска
+            plain = build_system(dict(cfg, web_search=WEB_OFF))
+            msgs, mt = fit_messages(cfg, plain, history, tail, max_tok)
+            answer, _ = _stream_answer(cfg, msgs, mt, emit, sniff=False)
+    if LAST_FINISH["reason"] == "length" and answer.strip():
+        note = (note + "\n   " if note else "") + (
+            f"✂️ Ответ упёрся в лимит длины ({mt} токенов) — увеличьте «Максимальную длину "
+            "ответа» в разделе «Характер и длина ответов».")
+    status("")
+    if cfg.get("llm_source") != SRC_LITELLM:
+        tps = None
+        try:  # скорость генерации без учёта чтения промпта
+            tps = _HTTP.get(ENGINE_BASE + "/api/extra/perf", timeout=2).json().get("last_eval_speed")
+        except (requests.RequestException, ValueError):
+            pass
+        ENGINE_STATE.update(llm_sec=time.time() - t0, llm_tps=tps or None)
+    return strip_think(answer), sent, note
+
+
+# ----------------------------- Поиск в интернете -----------------------------
+#
+# ddgs опрашивает поисковики без ключей (Google, DuckDuckGo, Yahoo, Brave…). Любой из
+# них может не ответить (блокировка, капча, лимит запросов), поэтому спрашиваем все
+# сразу, каждый отдельно и параллельно: встроенный в ddgs перебор нескольких поисковиков
+# теряет ответы тех, кто не успел к концу перебора. Набор поисковиков зависит от версии
+# ddgs (в 9.16 нет Bing и Яндекса для текста) — берём те, что есть.
+# К сниппетам добавляется текст трёх лучших страниц — абзацы с наибольшим числом
+# слов запроса. Прокси — как у браузера (настройки Windows / переменные окружения).
+
+# порядок — чьи результаты идут первыми; неизвестные ddgs имена пропускаются
+SEARCH_BACKENDS = ("yandex", "google", "duckduckgo", "yahoo", "bing", "brave", "startpage",
+                   "mojeek")
+NEWS_BACKENDS = ("yandex", "bing", "duckduckgo", "yahoo")
+NO_WEB_ENGINES = ("wikipedia", "grokipedia")  # энциклопедии — только если поисковики молчат
+NEWS_RE = re.compile(r"новост|что нового|что происходит|последние событ|что случилось", re.I)
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+SKIP_FETCH = ("youtube.com", "youtu.be", "vk.com", "t.me", "instagram.com", "facebook.com",
+              "twitter.com", "x.com", "tiktok.com", "ok.ru", "dzen.ru")
+STOP_STEMS = {"как", "что", "это", "для", "где", "или", "так", "при", "все", "вот", "был",
+              "есть", "можно", "котор", "сейча", "тако", "како"}
+
+
+def _domain(url):
+    host = urllib.parse.urlparse(url or "").netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _system_proxy():
+    """Прокси из настроек Windows / переменных окружения (VPN-клиенты ставят его туда)."""
+    try:
+        p = urllib.request.getproxies()
+    except Exception:
+        return None
+    proxy = p.get("https") or p.get("http")
+    if proxy and "://" not in proxy:
+        proxy = "http://" + proxy
+    return proxy or None
+
+
+def wiki_hits(query):
+    r = requests.get("https://ru.wikipedia.org/w/api.php", params={
+        "action": "query", "list": "search", "srsearch": query, "srlimit": 3,
+        "format": "json", "utf8": 1}, headers={"User-Agent": "RU-Voice-Assistant/1.0"}, timeout=8)
     r.raise_for_status()
-    return strip_think(r.json()["choices"][0]["message"]["content"])
+    return [{"title": x["title"], "body": html_unescape(re.sub(r"<[^>]+>", "", x.get("snippet", ""))),
+             "url": "https://ru.wikipedia.org/wiki/" + urllib.parse.quote(x["title"].replace(" ", "_")),
+             "date": ""} for x in r.json().get("query", {}).get("search", [])]
+
+
+def _ddgs_backends(category, preferred):
+    """Поисковики установленной версии ddgs: сначала из preferred, затем новые незнакомые."""
+    try:
+        from ddgs.engines import ENGINES
+        have = [k for k in ENGINES.get(category, {}) if k not in NO_WEB_ENGINES]
+    except Exception:  # другая версия ddgs — пусть разбирается сама
+        return list(preferred)
+    return [b for b in preferred if b in have] + sorted(set(have) - set(preferred))
+
+
+def _parallel_hits(query, tasks, max_results, deadline=8.0, grace=1.2):
+    """Все поисковики сразу: [(вид, поисковик)] -> ({(вид, поисковик): [результат]}, [ошибки]).
+    Ждём до первого ответа и ещё grace секунд — остальные не задерживают ответ."""
+    from ddgs import DDGS
+    proxy = _system_proxy()
+
+    def one(kind, backend):
+        ddg = DDGS(proxy=proxy, timeout=6)
+        if kind == "news":
+            return ddg.news(query, region="ru-ru", safesearch="moderate", timelimit="w",
+                            max_results=max_results, backend=backend)
+        return ddg.text(query, region="ru-ru", safesearch="moderate", max_results=max_results,
+                        backend=backend)
+
+    pool = ThreadPoolExecutor(max_workers=max(1, len(tasks)))
+    futs = {pool.submit(one, *t): t for t in tasks}
+    got, errors, t0, first = {}, [], time.time(), None
+    pending = set(futs)
+    try:
+        while pending:
+            left = t0 + deadline - time.time()
+            if first is not None:
+                left = min(left, first + grace - time.time())
+            if left <= 0:
+                break
+            done, pending = futures_wait(pending, timeout=left, return_when=FIRST_COMPLETED)
+            for f in done:
+                try:
+                    res = f.result()
+                except Exception as e:
+                    errors.append(f"{futs[f][1]}: {str(e)[:80]}")
+                    continue
+                if res:
+                    got[futs[f]] = res
+                    first = first or time.time()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return got, errors
+
+
+def _interleave(lists):
+    """[[a1, a2], [b1]] -> [a1, b1, a2]: лучшие результаты каждого поисковика — первыми."""
+    return [h for group in itertools.zip_longest(*lists) for h in group if h]
+
+
+def search_hits(query, max_results=6):
+    """-> [{title, url, body, date}] из поисковиков; если все молчат — из Википедии."""
+    text_b = _ddgs_backends("text", SEARCH_BACKENDS)
+    news_b = _ddgs_backends("news", NEWS_BACKENDS) if NEWS_RE.search(query) else []
+    tasks = [("news", b) for b in news_b] + [("text", b) for b in text_b]
+    try:
+        got, errors = _parallel_hits(query, tasks, max_results)
+    except ImportError:
+        got, errors = {}, ["нет пакета ddgs — запустите launch.bat ещё раз"]
+    news = _interleave([got[("news", b)] for b in news_b if ("news", b) in got])
+    text = _interleave([got[("text", b)] for b in text_b if ("text", b) in got])
+    hits = [{"title": h.get("title", ""), "url": h.get("url") or h.get("href", ""),
+             "body": h.get("body", ""), "date": (h.get("date") or "")[:10]} for h in news[:4]]
+    hits += [{"title": h.get("title", ""), "url": h.get("href") or h.get("url", ""),
+              "body": h.get("body", ""), "date": ""} for h in text]
+    print(f"[search] ответили: {', '.join(f'{k}/{b}' for k, b in got) or 'никто'}", flush=True)
+    if not hits:
+        try:
+            hits = wiki_hits(query)
+        except Exception as e:
+            errors.append(str(e))
+    seen, out = set(), []
+    for h in hits:
+        if h["url"] and h["url"] not in seen:
+            seen.add(h["url"])
+            out.append(h)
+    if not out:
+        raise RuntimeError("ничего не нашлось" + (f" ({'; '.join(errors)[:150]})" if errors else ""))
+    return out
+
+
+def page_blocks(data, charset=None):
+    """HTML (bytes) -> куски видимого текста в порядке страницы: абзацы целиком,
+    короткие строки (ячейки таблиц, подписи) склеены по ~300 символов."""
+    import lxml.html
+    text = None  # кодировку из заголовка или угаданную декодирует Python, из <meta> — lxml
+    if not charset and not re.search(rb"<meta[^>]+charset", data[:4096], re.I):
+        try:
+            from charset_normalizer import from_bytes
+            best = from_bytes(data[:200_000]).best()
+            charset = best.encoding if best else None
+        except Exception:
+            charset = None
+    if charset:
+        try:
+            text = re.sub(r"^\s*<\?xml[^>]*>", "", data.decode(charset, errors="replace"))
+        except LookupError:
+            text = None
+    try:
+        doc = lxml.html.document_fromstring(text if text is not None else data)
+    except (ValueError, lxml.etree.ParserError):
+        return []
+    for bad in doc.xpath("//script|//style|//noscript|//nav|//header|//footer|//aside|//form"
+                         "|//svg|//iframe|//template|//button|//select"):
+        bad.drop_tree()
+    for el in doc.iter("td", "th"):
+        el.tail = " | " + (el.tail or "")
+    for el in doc.iter("div", "p", "li", "h1", "h2", "h3", "h4", "h5", "tr", "dd", "dt", "br",
+                       "section", "article", "pre", "blockquote", "table", "ul", "ol"):
+        el.tail = "\n" + (el.tail or "")
+        el.text = "\n" + (el.text or "")
+    lines = [" ".join(x.split()).strip(" |") for x in doc.text_content().split("\n")]
+    chunks, cur, seen = [], "", set()
+    for line in lines:
+        if len(line) < 3 or line in seen:
+            continue
+        seen.add(line)
+        if len(line) >= 60:  # абзац — отдельный кусок; короткие строки (ячейки, подписи) — вместе
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:1500])
+            continue
+        if cur and len(cur) + len(line) > 300:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur} · {line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def fetch_page(url, limit_bytes=1_500_000):
+    r = requests.get(url, headers={"User-Agent": BROWSER_UA, "Accept-Language": "ru,en;q=0.8"},
+                     timeout=(4, 6), stream=True)
+    try:
+        r.raise_for_status()
+        ctype = r.headers.get("content-type", "")
+        if "html" not in ctype:
+            return []
+        data = r.raw.read(limit_bytes, decode_content=True)
+    finally:
+        r.close()
+    m = re.search(r"charset=['\"]?([\w-]+)", ctype, re.I)
+    return page_blocks(data, m.group(1) if m else None)
+
+
+def _stems(text):
+    return {w[:5] for w in re.findall(r"[a-zа-я0-9]{3,}", text.lower().replace("ё", "е"))} \
+        - STOP_STEMS
+
+
+def best_excerpt(chunks, query, limit):
+    """Куски страницы, где больше всего слов запроса (по первым 5 буквам — падежи)."""
+    qs, scored = _stems(query), []
+    for i, c in enumerate(chunks):
+        n = len(qs & _stems(c))
+        if not n:
+            continue
+        items = c.split(" · ")
+        if (len(items) >= 5 and len(c) / len(items) < 20
+                and sum(bool(re.search(r"\d", x)) for x in items) < len(items) * 0.3):
+            n *= 0.4  # меню сайта: «Бизнес · Экономика · Технологии · …» (не таблица чисел)
+        scored.append((n + (0.5 if re.search(r"\d", c) else 0), i, c[:700]))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    chosen, total, skipped = [], 0, []
+    for _, i, c in scored:
+        if total + len(c) <= limit:
+            chosen.append((i, c))
+            total += len(c) + 1
+        else:
+            skipped.append((i, c))
+    room = limit - total
+    if skipped and room >= 200:  # лучший не влезший кусок — хотя бы началом
+        i, c = skipped[0]
+        chosen.append((i, c[:room].rsplit(" ", 1)[0] + " …"))
+    return " ".join(c for _, c in sorted(chosen))
+
+
+def web_search(query, max_chars=6000):
+    """Поиск + текст лучших страниц -> (текст результатов для модели, [url])."""
+    hits = search_hits(query)[:6]
+    fetch = [h["url"] for h in hits if not any(d in _domain(h["url"]) for d in SKIP_FETCH)][:3]
+    pages = {}
+    if fetch:
+        pool = ThreadPoolExecutor(max_workers=len(fetch))
+        futs = {pool.submit(fetch_page, u): u for u in fetch}
+        done, _ = futures_wait(futs, timeout=9)
+        pool.shutdown(wait=False, cancel_futures=True)
+        for f in done:
+            try:
+                pages[futs[f]] = f.result()
+            except Exception as e:
+                print(f"[search] {_domain(futs[f])}: {str(e)[:100]}", flush=True)
+    per_page = int(max_chars * 0.6 / max(1, len(pages)))
+    parts, urls, total = [], [], 0
+    for n, h in enumerate(hits, 1):
+        date = f", {h['date']}" if h.get("date") else ""
+        text = f"[{n}] {h['title']} ({_domain(h['url'])}{date})\n{h['body']}".strip()
+        extra = best_excerpt(pages.get(h["url"]) or [], query, per_page)
+        if extra:
+            text += "\nСо страницы: " + extra
+        if total + len(text) > max_chars:
+            text = text[:max_chars - total]
+            if len(text) < 120:
+                break
+        parts.append(text)
+        urls.append(h["url"])
+        total += len(text) + 2
+    return "\n\n".join(parts), urls
 
 
 # ----------------------------- TTS (Silero) ---------------------------------
@@ -1092,18 +1791,135 @@ def speak(text, voice):
     return out
 
 
+SENT_END_RE = re.compile(r"[.!?…]+[\"»)]*\s+|\n+")
+
+
+class SpeechStream:
+    """Озвучка ответа по мере генерации: предложения -> Silero (фоновый поток) ->
+    play(кусок) сразу в динамики (wake word). Без play — только собрать WAV (браузер):
+    синтез идёт параллельно с генерацией, и в конце ждать почти нечего."""
+
+    def __init__(self, voice, play=None, on_start=None):
+        self.voice, self.play, self.on_start = voice, play, on_start
+        self.buf, self.fed, self.n = "", "", 0
+        self.parts, self.cancelled = [], False
+        self.q_synth, self.q_play = queue.Queue(), queue.Queue()
+        self.t_synth = threading.Thread(target=self._synth_loop, daemon=True)
+        self.t_synth.start()
+        self.t_play = None
+        if play:
+            self.t_play = threading.Thread(target=self._play_loop, daemon=True)
+            self.t_play.start()
+
+    def feed(self, text):
+        self.buf += text
+        self.fed += text
+        while True:
+            min_len = 20 if self.n == 0 else 80  # первая фраза — как можно раньше
+            cut = next((m.end() for m in SENT_END_RE.finditer(self.buf) if m.end() >= min_len), None)
+            if cut is None:
+                if len(self.buf) <= 400:
+                    return
+                k = max(self.buf.rfind(", ", 0, 350), self.buf.rfind(" ", 0, 350))
+                cut = k + 1 if k > 0 else 350
+            chunk, self.buf = self.buf[:cut], self.buf[cut:]
+            self._put(chunk)
+
+    def _put(self, chunk):
+        if chunk.strip():
+            self.n += 1
+            self.q_synth.put(chunk)
+
+    def _synth_loop(self):
+        pause = np.zeros(int(SAMPLE_RATE_TTS * 0.25), dtype=np.float32)
+        while True:
+            chunk = self.q_synth.get()
+            if chunk is None or self.cancelled:
+                self.q_play.put(None)
+                return
+            try:
+                model = load_tts()
+                for piece in split_long(clean_for_tts(chunk)):
+                    if not re.search(r"[а-яё]", piece, re.I):
+                        continue  # Silero падает на тексте без единой буквы
+                    audio = model.apply_tts(text=piece, speaker=self.voice,
+                                            sample_rate=SAMPLE_RATE_TTS)
+                    arr = audio.numpy() if torch.is_tensor(audio) else np.asarray(audio)
+                    arr = np.concatenate([np.asarray(arr, dtype=np.float32).flatten(), pause])
+                    self.parts.append(arr)
+                    if self.play:
+                        self.q_play.put(arr)
+            except Exception as e:
+                print(f"[tts] {e}", flush=True)
+
+    def _play_loop(self):
+        started = False
+        while True:
+            arr = self.q_play.get()
+            if arr is None:
+                return
+            if self.cancelled:
+                continue
+            if not started:
+                started = True
+                if self.on_start:
+                    self.on_start()
+            try:
+                self.play(arr)
+            except Exception as e:
+                print(f"[play] {e}", flush=True)
+
+    def finish(self):
+        """Дождаться озвучки (и проигрывания) всего ответа -> путь к WAV."""
+        self._put(self.buf)
+        self.buf = ""
+        self.q_synth.put(None)
+        self.t_synth.join()
+        if self.t_play:
+            self.t_play.join()
+        pause = np.zeros(int(SAMPLE_RATE_TTS * 0.25), dtype=np.float32)
+        full = np.concatenate(self.parts) if self.parts else pause
+        out = os.path.join(tempfile.gettempdir(), "ru_assistant_reply.wav")
+        sf.write(out, full, SAMPLE_RATE_TTS)
+        return out
+
+    def cancel(self):
+        self.cancelled = True
+        self.q_synth.put(None)
+
+
 # ----------------------------- Общий пайплайн --------------------------------
 
-def answer_and_speak(user_text, cfg):
-    """LLM + TTS + история. Потокобезопасно (общий для GUI и wake word)."""
+def answer_and_speak(user_text, cfg, play=None, on_status=None, on_speaking=None):
+    """Вопрос -> (поиск) -> LLM потоком -> Silero по предложениям -> (ответ, WAV).
+    Потокобезопасно (общий для GUI и wake word). play(кусок) — сразу в динамики."""
     with PIPE_LOCK:
-        messages = build_messages(history_snapshot(), user_text)
-        if cfg["llm_source"] == SRC_LITELLM:
-            answer = answer_litellm(cfg, messages)
-        else:
-            answer = answer_local(cfg, messages)
-        wav = speak(answer, cfg["voice"])
-        history_append(user_text, answer)
+        live_update(user=user_text, text="", status="🧠 Думаю…")
+        speech, shown = SpeechStream(cfg["voice"], play=play, on_start=on_speaking), []
+
+        def emit(piece):
+            shown.append(piece)
+            speech.feed(piece)
+            live_update(text=strip_think("".join(shown)), status="")
+
+        def status(text):
+            live_update(status=text)
+            if on_status:
+                on_status(text)
+
+        try:
+            answer, sent, note = think_answer(user_text, cfg, emit=emit, status=status)
+            if not answer:
+                answer = "Не получилось ответить — попробуйте переформулировать вопрос."
+                speech.feed(answer)
+            if play is None:
+                live_update(text=answer, status="🔊 Озвучиваю…")
+            wav = speech.finish()
+        except BaseException:
+            speech.cancel()
+            live_update(user="", text="", status="")
+            raise
+        history_append(user_text, answer, sent=sent, note=note)
         return answer, wav
 
 
@@ -1461,12 +2277,21 @@ def _wake_main(gen, stop_ev):
         report(phase="recognizing", info="")
         return whisper_pcm(resample_int16(pcm, pcm_sr), cfg)
 
-    def process(question):
-        answer, wav = answer_and_speak(question, get_cfg())
-        report(phase="speaking", info=f"Ответ: «{answer[:150]}»")
-        data, wav_sr = sf.read(wav, dtype="float32", always_2d=True)
-        sd.play(data, wav_sr)
+    def play_now(arr):
+        sd.play(arr, SAMPLE_RATE_TTS)
         sd.wait()
+
+    def process(question):
+        def on_status(text):
+            if text.startswith("🌐"):
+                report(phase="searching", info=text)
+            elif text:
+                report(phase="thinking", info=text)
+
+        # первые предложения звучат, пока модель дописывает остальное
+        answer, _ = answer_and_speak(question, get_cfg(), play=play_now, on_status=on_status,
+                                     on_speaking=lambda: report(phase="speaking", info=""))
+        report(phase="speaking", info=f"Ответ: «{answer[:150]}»")
         time.sleep(0.3)  # хвост эха из динамиков; затем wake_loop чистит очередь
 
     try:
@@ -1509,6 +2334,7 @@ PHASE_TEXT = {
     "listening": "🟡 Слушаю вопрос…",
     "recognizing": "✍️ Распознаю вопрос (Whisper)…",
     "thinking": "🧠 Думаю…",
+    "searching": "🌐 Ищу в интернете…",
     "speaking": "🔊 Отвечаю…",
     "error": "🔴 Wake word не работает",
 }
@@ -1568,6 +2394,8 @@ def render_engine_status(cfg=None):
     if st.get("llm_sec") is not None:
         speed.append(f"LLM {st['llm_sec']:.1f} с"
                      + (f" ({st['llm_tps']:.0f} ток/с)" if st.get("llm_tps") else ""))
+    if st.get("search_sec") is not None:
+        speed.append(f"из них поиск {st['search_sec']:.1f} с")
     if speed:
         lines.append("⏱ Последний вопрос: " + " · ".join(speed))
     try:
@@ -1590,7 +2418,8 @@ def render_engine_status(cfg=None):
 SETTING_FIELDS = ["voice", "llm_source", "hf_repo", "hf_file", "local_gguf_path",
                   "litellm_base", "litellm_key", "litellm_model", "n_ctx",
                   "wake_word", "wake_enabled", "wake_device",
-                  "stt_engine", "compute", "whisper_model", "whisper_prompt", "gpu_layers"]
+                  "stt_engine", "compute", "whisper_model", "whisper_prompt", "gpu_layers",
+                  "system_prompt", "max_tokens", "web_search"]
 
 
 def make_cfg(*values):
@@ -1599,6 +2428,7 @@ def make_cfg(*values):
     cfg.update({k: v for k, v in _wake["cfg"].items() if k not in SETTING_FIELDS})
     cfg.update(zip(SETTING_FIELDS, values))
     cfg["gpu_layers"] = _int(cfg.get("gpu_layers"), -1)
+    cfg["max_tokens"] = max(64, min(8192, _int(cfg.get("max_tokens"), DEFAULT_MAX_TOKENS)))
     return cfg
 
 
@@ -1610,25 +2440,32 @@ def apply_settings(*cfg_values):
     return cfg
 
 
-def respond(audio_path, text_input, *cfg_values, progress=gr.Progress()):
+def respond(audio_path, text_input, *cfg_values):
+    """Вопрос из браузера. Текст ответа появляется в «Диалоге» по мере генерации
+    (его обновляет таймер poll_ui), озвучка — когда ответ готов."""
     cfg = apply_settings(*cfg_values)
+
+    def note(msg):
+        return (render_log() + "\n" + msg).strip()
+
     try:
         user_text = (text_input or "").strip()
         if not user_text:
             if not audio_path:
-                return None, "Запишите голос или напишите текст.", ""
-            progress(0.1, desc="Распознаю речь…")
-            user_text = transcribe(audio_path, cfg)
+                return None, note("⚠️ Запишите голос или напишите текст."), gr.skip()
+            live_update(status="✍️ Распознаю речь…")
+            try:
+                user_text = transcribe(audio_path, cfg)
+            finally:
+                live_update(status="")
         if not user_text:
-            return None, "Ничего не расслышал — попробуйте ещё раз.", ""
-        progress(0.35, desc="Думаю (первый запуск скачает модели — статус движка выше)…")
+            return None, note("⚠️ Ничего не расслышал — попробуйте ещё раз."), gr.skip()
         answer, wav = answer_and_speak(user_text, cfg)
         # ответ сейчас зазвучит из браузера — wake word не должен слушать сам себя
         MUTE_UNTIL[0] = time.time() + sf.info(wav).duration + 1.5
-        progress(0.9, desc="Готово")
         return wav, render_log(), ""
     except Exception as e:
-        return None, f"Ошибка: {e}", ""
+        return None, note(f"⚠️ Ошибка: {e}"), gr.skip()
 
 
 def on_wake_toggle(*cfg_values):
@@ -1716,7 +2553,21 @@ def build_ui():
                            label="Распознавание вопроса")
             compute = gr.Radio([COMPUTE_GPU, COMPUTE_CPU], value=s["compute"],
                                label="Где считать LLM и Whisper")
+        web_search = gr.Radio(WEB_MODES, value=s["web_search"], label="🌐 Поиск в интернете")
         engine_status = gr.Markdown(render_engine_status(s))
+        with gr.Accordion("🧠 Характер и длина ответов (системный промпт)", open=False):
+            system_prompt = gr.Textbox(
+                label="Системный промпт — инструкция для модели", value=s["system_prompt"],
+                lines=6, max_lines=20,
+                info="Пустое поле — стандартный промпт. Текущие дата и время и правила "
+                     "поиска добавляются к нему автоматически.")
+            with gr.Row():
+                preset_buttons = [gr.Button(name, size="sm") for name in PROMPT_PRESETS]
+            max_tokens = gr.Slider(
+                128, 4096, value=int(s["max_tokens"]), step=64,
+                label="Максимальная длина ответа (токенов)",
+                info="≈ 1000 токенов — 2500–3000 знаков, 2–3 минуты речи. Для локальной "
+                     "модели не больше половины контекста.")
         with gr.Accordion("Настройки моделей", open=False):
             with gr.Row():
                 hf_repo = gr.Textbox(label="HF репозиторий", value=s["hf_repo"],
@@ -1771,18 +2622,25 @@ def build_ui():
         with gr.Row():
             clear = gr.Button("🗑 Сбросить диалог")
         reply = gr.Audio(label="Ответ (озвучка)", type="filepath", autoplay=True)
-        log = gr.Textbox(label="Диалог", lines=10)
+        log = gr.Textbox(label="Диалог", lines=12, max_lines=40, autoscroll=True)
         seen = gr.State({})
 
         cfg_inputs = [voice, mode, hf_repo, hf_file, local_gguf, base_url, api_key,
                       model_name, n_ctx, wake_word, wake_enabled, wake_device,
-                      stt, compute, whisper_model, whisper_prompt, gpu_layers]
+                      stt, compute, whisper_model, whisper_prompt, gpu_layers,
+                      system_prompt, max_tokens, web_search]
         respond_inputs = [audio, text_input] + cfg_inputs
         respond_outputs = [reply, log, text_input]
         engine_controls = (mode, stt, compute, whisper_model)
+        # индикатор загрузки — только на плеере: «Диалог» под ним показывает ответ вживую
+        busy = ({"show_progress_on": [reply]}
+                if "show_progress_on" in inspect.signature(text_input.submit).parameters
+                else {"show_progress": "minimal"})
 
-        text_input.submit(respond, inputs=respond_inputs, outputs=respond_outputs)
-        audio.stop_recording(respond, inputs=respond_inputs, outputs=respond_outputs)
+        text_input.submit(respond, inputs=respond_inputs, outputs=respond_outputs, **busy)
+        audio.stop_recording(respond, inputs=respond_inputs, outputs=respond_outputs, **busy)
+        for button, preset in zip(preset_buttons, PROMPT_PRESETS.values()):
+            button.click(lambda p=preset: p, outputs=[system_prompt])
         wake_enabled.change(on_wake_toggle, inputs=cfg_inputs, outputs=[wake_status])
         wake_device.change(on_device_change, inputs=cfg_inputs, outputs=[wake_status])
         refresh.click(refresh_devices, outputs=[wake_device])

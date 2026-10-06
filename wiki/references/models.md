@@ -14,6 +14,7 @@
 | LLM (облако) | любая за LiteLLM | endpoint пользователя | — | — | OpenAI-совместимый API |
 | Движок | KoboldCpp 1.122.1 (nocuda: Vulkan + CPU) | `github.com/LostRuins/koboldcpp` releases | ~120 МБ | AGPL-3.0 | отдельный процесс, не линкуется с кодом; sha256 зашит в app.py |
 | TTS-текст | num2words | PyPI | <1 МБ | LGPL-2.1 | числа → слова перед Silero |
+| Поиск | ddgs ≥ 9.16, < 10 (+ primp, lxml) | PyPI, `github.com/deedy5/ddgs` | ~10 МБ | MIT (lxml — BSD-3) | поиск без ключей; набор поисковиков меняется от версии к версии ([WEB-003]) |
 
 ## Проверка ссылок перед релизом
 `curl -sI -L <url>` → 200. Официальный репозиторий Qwen GGUF отдаёт 401 — см. [LLM-001].

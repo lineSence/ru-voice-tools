@@ -13,7 +13,21 @@
    латиницей; wake word режим: Vosk ловит слово, Whisper — вопрос; Whisper упал → Vosk + предупреждение.
 7. **Озвучка текста** (`test_tts_text.py`): латиница и числа превращаются в русские слова.
 8. **GUI**: поднять app.py, `curl` → HTTP 200 / Playwright-прогон, погасить; проверить, что не осталось процессов koboldcpp.
-9. **Zip** без `.venv`, `__pycache__`, `.installed*`, `engine/`, `settings.json`.
+9. **Zip** без `.venv`, `__pycache__`, `.installed*`, `engine/`, `settings.json`, `tests/`.
+
+## Тесты v4 (`voice-assistant/tests/`)
+Нужны: venv с requirements + `playwright`, `pyflakes`; KoboldCpp, распакованный в `/tmp/engine`
+(`TEST_ENGINE_DIR`); тестовая `qwen05.gguf` (Qwen2.5-0.5B-Instruct Q4_K_M) и для маршрутизации
+Qwen3-4B-Instruct-2507 Q4_K_M в `/tmp/kcpp` (`TEST_MODELS_DIR`). Путь к app.py — аргумент или папка выше.
+
+| Файл | Что проверяет | Время (2 vCPU) |
+|---|---|---|
+| `test_units_v4.py` | 57 юнит-проверок: промпты, дата, fit_messages, sniffer, think, поиск с поддельным ddgs, страницы, озвучка | 1 мин |
+| `test_integration_v4.py` | LiteLLM-заглушка (протокол поиска, JSON, 500, лимит), настоящий KoboldCpp: поток, abort, принудительный поиск, Silero, перезапуск | 4 мин |
+| `test_wake_stream_v4.py` | поддельный sounddevice: wake word → вопрос → первый звук до конца генерации | 1,5 мин |
+| `test_search_live.py` | живой поиск (сеть): погода, версия Python, курс, новости | 20 с |
+| `test_routing_qwen3_4b.py`, `test_ask_mode_qwen3_4b.py` | решения «искать/отвечать» и длина ответа на Qwen3-4B | 10 мин |
+| `test_gui_e2e_v4.py` (+ `gui_server.py`) | Playwright: элементы, пресеты, автосохранение, ответ вживую, поиск, озвучка | 3 мин |
 
 ## Релиз в GitHub
 - Файлы пушатся одним коммитом через GitHub MCP `push_files`.

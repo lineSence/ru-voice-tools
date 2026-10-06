@@ -6,6 +6,7 @@ __pycache__/
 .installed
 .installed-v2
 .installed-v3
+.installed-v4
 settings.json
 engine/
 *.wav

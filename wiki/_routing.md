@@ -20,15 +20,22 @@ triggers:
       - wiki/rules/engine-kobold.md
       - wiki/references/models.md
   - id: tts
-    keywords: [silero, tts, синтез, озвучка, голос, aidar, kseniya, ударение]
+    keywords: [silero, tts, синтез, озвучка, голос, aidar, kseniya, ударение, speechstream, по предложениям]
     load:
       - wiki/rules/tts-silero.md
       - wiki/references/models.md
   - id: llm
-    keywords: [llm, gguf, qwen, gemma, litellm, llama-cpp, ollama, модель, промпт, think]
+    keywords: [llm, gguf, qwen, gemma, litellm, llama-cpp, ollama, модель, промпт, системный промпт,
+               think, длина ответа, max_tokens, контекст, n_ctx, stream, поток, дата, время]
     load:
       - wiki/rules/llm-local.md
       - wiki/references/models.md
+  - id: web
+    keywords: [поиск, интернет, ddgs, duckduckgo, yahoo, google, поисковик, "ПОИСК:", новости, погода,
+               курс, страницы, выдержки, прокси поиска]
+    load:
+      - wiki/rules/web-search.md
+      - wiki/rules/llm-local.md
   - id: ui
     keywords: [gradio, gui, интерфейс, 7860, 7861, 502, прокси, vpn, localhost]
     load:
