@@ -5,7 +5,7 @@
 ```yaml
 triggers:
   - id: stt
-    keywords: [vosk, stt, распознавание, микрофон, whisper, аудио-вход, 16000]
+    keywords: [vosk, stt, распознавание, микрофон, whisper, аудио-вход, 16000, wake word, sounddevice]
     load:
       - wiki/rules/stt-vosk.md
       - wiki/references/models.md

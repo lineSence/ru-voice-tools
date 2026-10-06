@@ -26,8 +26,18 @@ os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 `.change(autosave, inputs=cfg_inputs)` на каждом поле, значения при старте — из файла.
 Файл в .gitignore (может содержать API-ключ LiteLLM — предупреждать в README).
 При добавлении полей — не забыть `SETTING_FIELDS` (порядок = порядок inputs).
+Баг 2026-10-05: галочка wake word не входила в `SETTING_FIELDS` и не сохранялась —
+теперь там же `wake_enabled` и `wake_device`; при старте с галочкой слушатель запускается сам.
 
 ## [GRADIO-006] Серверные события в UI — gr.Timer
-Фоновые потоки (wake word) не могут сами обновить браузер: кладут события в
-`queue.Queue`, а `gr.Timer(1.0).tick(...)` раз в секунду вычитывает и обновляет
-компоненты через `gr.skip()` для неизменных. Аудио с `autoplay=True` проиграется само.
+Фоновые потоки (wake word) не могут сами обновить браузер. Состояние лежит в общем dict
+(`WAKE_STATE`), диалог — со счётчиком версии `HISTORY_VER`; `gr.Timer(0.5).tick(poll_ui,
+inputs=[gr.State], outputs=[...], show_progress="hidden")` отдаёт только изменившееся,
+остальное — `gr.skip()`. Без `show_progress="hidden"` компоненты мигают каждые полсекунды.
+Ответ wake word НЕ отдавать в `gr.Audio(autoplay=True)`: он уже звучит из динамиков через
+sounddevice — будет двойное воспроизведение. И наоборот: пока звучит ответ из браузера,
+wake word заглушён (`MUTE_UNTIL`), иначе ассистент услышит себя.
+
+## [GRADIO-007] Playwright-тесты GUI
+`page.goto(..., wait_until="load")` + ожидание нужного элемента. `networkidle` не наступает
+никогда: таймер опрашивает сервер каждые 0,5 с.

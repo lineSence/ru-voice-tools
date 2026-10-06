@@ -7,7 +7,8 @@ STT : Vosk (русская модель, скачивается автомати
 LLM : любая GGUF (Hugging Face repo+file или локальный .gguf) через llama-cpp-python,
       либо OpenAI-совместимый endpoint (LiteLLM-прокси)
 TTS : Silero v5 (скачивается автоматически, ~140 МБ)
-Wake word: Vosk keyword spotting через системный микрофон (sounddevice)
+Wake word: Vosk расшифровывает микрофон компьютера (sounddevice), слово-триггер
+           ищется в тексте нечётко; вопрос — та же фраза после него или следующая
 
 Всё работает на CPU, GPU не требуется. Настройки автосохраняются в settings.json.
 """
@@ -19,6 +20,7 @@ import os
 os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 
+import difflib
 import gc
 import inspect
 import json
@@ -27,6 +29,7 @@ import queue
 import re
 import tempfile
 import threading
+import time
 
 import numpy as np
 import soundfile as sf
@@ -43,6 +46,7 @@ VOICES = ["aidar", "baya", "kseniya", "xenia", "eugene", "random"]
 SRC_HF = "Hugging Face GGUF"
 SRC_LOCAL = "Локальный файл .gguf"
 SRC_LITELLM = "LiteLLM-прокси (облако)"
+DEFAULT_DEVICE = "Системный по умолчанию"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
@@ -59,6 +63,7 @@ DEFAULT_SETTINGS = {
     "n_ctx": 4096,
     "wake_enabled": False,
     "wake_word": "ассистент",
+    "wake_device": DEFAULT_DEVICE,
 }
 
 SYSTEM_PROMPT = (
@@ -76,6 +81,7 @@ _llm = {"key": None, "obj": None}
 _tts = {"model": None}
 
 HISTORY = []
+HISTORY_VER = [0]  # растёт при каждом изменении диалога — таймер GUI видит новое
 HISTORY_LOCK = threading.Lock()
 PIPE_LOCK = threading.Lock()
 
@@ -110,6 +116,7 @@ def history_append(user_text, answer):
         HISTORY.append({"role": "user", "content": user_text})
         HISTORY.append({"role": "assistant", "content": answer})
         del HISTORY[:-HISTORY_KEEP * 2]
+        HISTORY_VER[0] += 1
 
 
 def render_log():
@@ -337,156 +344,397 @@ def answer_and_speak(user_text, cfg):
 
 
 # ----------------------------- Wake word -------------------------------------
+#
+# Микрофон компьютера -> «свободный» распознаватель Vosk, который расшифровывает
+# всё подряд (в GUI это строка «Слышу: …»). Wake word ищется в расшифровке
+# нечётко (падежи, «асистент», «систент»). Вопрос — текст ПОСЛЕ wake word в той же
+# фразе («Ассистент, какая погода?») или следующая фраза, если после wake word
+# была пауза (тогда звучит сигнал «слушаю»). Конец фразы определяет сам Vosk по
+# паузе (endpointing), а не порог громкости: фиксированный порог RMS ломался от
+# шума вентилятора — вопрос «не заканчивался» по 30 секунд.
 
-WAKE_EVENTS = queue.Queue()
-_wake = {"thread": None, "stop": threading.Event()}
-WAKE_FRAME = 4000  # сэмплов на кадр (0.25 с при 16 кГц)
+QUESTION_TIMEOUT = 8.0   # сек ждать вопрос после одиночного wake word
+SILENT_DB = -75.0        # тише — микрофон фактически отдаёт нули
+WAKE_STATE = {"phase": "off", "level": -90.0, "heard": "", "info": "", "warn": "",
+              "note": "", "device": "", "wake": "", "silent": False}
+_wake = {"thread": None, "stop": None, "gen": 0, "cfg": dict(DEFAULT_SETTINGS)}
+MUTE_UNTIL = [0.0]  # до этого времени браузер озвучивает ответ — микрофон не слушаем
 
 
-def wake_loop(read_frame, play_audio, process, cfg,
-              flush=lambda: None, stop=lambda: False):
-    """Ядро wake word, тестируется без микрофона.
-    read_frame() -> bytes (int16 16kHz mono) или None для остановки.
-    play_audio(float32_array, sample_rate) — проигрывание ответа.
-    process(user_text) — вызов пайплайна LLM+TTS."""
+def _norm_word(w):
+    return w.lower().replace("ё", "е")
+
+
+def parse_wake_words(raw):
+    """'ассистент, окей компьютер' -> [['ассистент'], ['окей', 'компьютер']]"""
+    phrases = []
+    for part in re.split(r"[,;|\n]+", raw or ""):
+        words = [_norm_word(w) for w in re.findall(r"\w+", part)]
+        if words and words not in phrases:
+            phrases.append(words)
+    return phrases or [["ассистент"]]
+
+
+def _word_like(heard, wake):
+    """Похоже ли распознанное слово на слово-триггер."""
+    if heard == wake:
+        return True
+    if len(wake) < 5 or len(heard) < 4:
+        return False  # короткие слова — только точное совпадение
+    # падежи и окончания: «ассистента», «компьютеру»
+    if len(os.path.commonprefix([heard, wake])) >= max(4, len(wake) - 2):
+        return True
+    # огрехи распознавания: «асистент», «систент»
+    return difflib.SequenceMatcher(None, heard, wake).ratio() >= 0.8
+
+
+def find_wake(words, phrases):
+    """Первое вхождение wake word в списке слов -> (начало, конец) или None."""
+    norm = [_norm_word(w) for w in words]
+    for i in range(len(norm)):
+        for ph in phrases:
+            j = i + len(ph)
+            if j <= len(norm) and all(_word_like(norm[i + k], ph[k]) for k in range(len(ph))):
+                return i, j
+    return None
+
+
+def missing_wake_words(model, phrases):
+    """Слова, которых нет в словаре модели Vosk, — их она не услышит никогда."""
+    finder = getattr(model, "vosk_model_find_word", None)
+    out = []
+    if finder is None:
+        return out
+    for ph in phrases:
+        for w in ph:
+            try:
+                if finder(w) < 0:
+                    out.append(w)
+            except Exception:
+                pass
+    return out
+
+
+def make_beep(sr=SAMPLE_RATE_TTS):
+    """Короткий двухтоновый сигнал «слушаю»."""
+    t = np.arange(int(sr * 0.08)) / sr
+    tone = np.concatenate([np.sin(2 * np.pi * 660 * t), np.sin(2 * np.pi * 990 * t)])
+    idx = np.arange(tone.size)
+    ramp = np.minimum(1.0, np.minimum(idx, tone.size - idx) / (0.008 * sr))
+    return (0.3 * tone * ramp).astype(np.float32)
+
+
+def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
+              flush=lambda: None, stop=lambda: False, report=None, muted=lambda: False):
+    """Ядро wake word; тестируется без микрофона.
+    read_frame() -> bytes (int16 mono, частота sr) | b"" (пока пусто) | None (стоп).
+    process(question) — LLM + TTS + проигрывание; блокирует (себя в это время не слушаем).
+    get_cfg() -> текущие настройки: wake word можно менять на лету.
+    report(**поля) — обновление состояния для GUI.
+    muted() -> True, пока ответ звучит из браузера (иначе ассистент услышит сам себя)."""
+    report = report or (lambda **kv: WAKE_STATE.update(kv))
     model = load_stt()
-    wake_word = (cfg["wake_word"] or "ассистент").strip().lower()
-    WAKE_EVENTS.put(("status", f"Слушаю wake word «{wake_word}»..."))
+
+    def new_rec():
+        return vosk.KaldiRecognizer(model, sr)  # Vosk сам приведёт частоту к 16 кГц
+
+    rec = new_rec()
+    t = 0.0               # сколько секунд аудио обработано
+    level = -90.0
+    loud_at = 0.0         # когда последний раз с микрофона шли не нули
+    raw_wake, phrases = None, []
+    pending_until = None  # был одиночный wake word — ждём вопрос до этого момента
+    was_muted = False
+    report(phase="waiting", heard="", info="")
     while not stop():
-        # ensure_ascii=False обязателен: парсер Vosk не декодирует \uXXXX,
-        # и кириллическое слово "пропадает" из грамматики
-        rec = vosk.KaldiRecognizer(
-            model, SAMPLE_RATE_STT, json.dumps([wake_word, "[unk]"], ensure_ascii=False))
-        spotted = False
-        while not stop() and not spotted:
-            fr = read_frame()
-            if fr is None:
-                return
-            if not fr:
-                continue
-            if rec.AcceptWaveform(fr):
-                spotted = wake_word in json.loads(rec.Result()).get("text", "")
-            else:
-                spotted = wake_word in json.loads(rec.PartialResult()).get("partial", "")
-        if stop():
+        fr = read_frame()
+        if fr is None:
             return
-        flush()  # выкинуть накопившийся фон
-        # отбросить ~0.6 с: договаривается хвост wake word, он не должен
-        # попасть в распознавание вопроса ("...сбер" от "компьютер")
-        tail = int(0.6 * SAMPLE_RATE_STT / WAKE_FRAME)
-        for _ in range(tail):
-            fr = read_frame()
-            if fr is None:
-                return
-        rec2 = vosk.KaldiRecognizer(model, SAMPLE_RATE_STT)
-        heard, silent, total = False, 0, 0
-        while not stop():
-            fr = read_frame()
-            if fr is None:
-                return
-            if not fr:
-                continue
-            total += 1
-            arr = np.frombuffer(fr, dtype=np.int16)
-            level = float(np.sqrt(np.mean(arr.astype(np.float64) ** 2))) if arr.size else 0.0
-            if level > 400:
-                heard, silent = True, 0
-            else:
-                silent += 1
-            rec2.AcceptWaveform(fr)
-            if heard and silent * WAKE_FRAME / SAMPLE_RATE_STT > 1.5:
-                break
-            if total * WAKE_FRAME / SAMPLE_RATE_STT > 30:
-                break
-        if stop():
-            return
-        text = json.loads(rec2.FinalResult()).get("text", "").strip()
-        # страховка: если wake word всё же попало в начало — срезать
-        if text.startswith(wake_word):
-            text = text[len(wake_word):].strip()
-        if not text:
-            WAKE_EVENTS.put(("status", "Не расслышал вопрос, слушаю дальше..."))
+        if not fr:
             continue
-        WAKE_EVENTS.put(("status", f"Услышал: «{text}». Думаю..."))
-        process(text)  # во время ответа и озвучки захват приостановлен — защита от эха
-        flush()
-        WAKE_EVENTS.put(("status", f"Слушаю wake word «{wake_word}»..."))
+        if muted():
+            was_muted = True
+            continue
+        if was_muted:  # после озвучки — с чистого листа
+            was_muted = False
+            rec = new_rec()
+        cur = (get_cfg().get("wake_word") or "").strip() or "ассистент"
+        if cur != raw_wake:
+            raw_wake, phrases = cur, parse_wake_words(cur)
+            miss = missing_wake_words(model, phrases)
+            report(wake=" / ".join("«" + " ".join(p) + "»" for p in phrases),
+                   warn=("Слов " + ", ".join(f"«{w}»" for w in miss)
+                         + " нет в словаре модели — она их не распознает, выберите другое wake word."
+                         ) if miss else "")
+        samples = np.frombuffer(fr, dtype=np.int16)
+        t += samples.size / sr
+        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) if samples.size else 0.0
+        db = 20 * math.log10(max(rms, 1.0) / 32768.0)
+        level = max(db, level - 2.0)  # индикатор: быстрая атака, плавный спад
+        if db > SILENT_DB:
+            loud_at = t
+        report(level=level, silent=t - loud_at > 5.0)
+
+        partial = ""
+        if rec.AcceptWaveform(fr):
+            text = json.loads(rec.Result()).get("text", "").strip()
+            question = None
+            if text:
+                report(heard=text)
+                print(f"[wake] слышу: {text}", flush=True)
+                words = text.split()
+                pos = find_wake(words, phrases)
+                if pos is not None:
+                    question = " ".join(words[pos[1]:])
+                    if not question:  # только wake word: сигнал и ждём вопрос
+                        pending_until = t + QUESTION_TIMEOUT
+                        report(phase="listening", info="")
+                        # распознаватель НЕ пересоздаём и очередь не чистим: если вопрос
+                        # начали говорить сразу, его начало не потеряется; сам сигнал
+                        # Vosk словами не считает (проверено тестом с эхом сигнала)
+                        beep()
+                        continue
+                elif pending_until is not None and len(text) > 2:
+                    question = text
+            if question:
+                pending_until = None
+                report(phase="thinking", info=f"Вопрос: «{question}»")
+                try:
+                    process(question)
+                    report(info=f"Последний вопрос: «{question}»")
+                except Exception as e:
+                    report(info=f"Ошибка ответа: {e}")
+                    print(f"[wake] ошибка ответа: {e}", flush=True)
+                flush()               # выкинуть всё, что микрофон слышал во время ответа (эхо)
+                rec = new_rec()
+                report(phase="waiting", heard="")
+                continue
+            if pending_until is None:
+                report(phase="waiting")
+        else:
+            partial = json.loads(rec.PartialResult()).get("partial", "").strip()
+            if partial:
+                report(heard=partial + "…")
+                if pending_until is None:
+                    report(phase="listening" if find_wake(partial.split(), phrases) else "waiting")
+        if pending_until is not None and t > pending_until and not partial:
+            pending_until = None
+            report(phase="waiting", info="Вопрос не прозвучал — снова жду wake word.")
 
 
-def _wake_main(cfg):
+def list_input_devices():
+    """Микрофоны для списка — только из хост-API по умолчанию: на Windows иначе
+    каждый микрофон виден 3–4 раза (MME / DirectSound / WASAPI / WDM-KS)."""
+    names = [DEFAULT_DEVICE]
+    try:
+        import sounddevice as sd
+        try:
+            api = sd.query_devices(kind="input")["hostapi"]
+        except Exception:
+            api = None
+        for d in sd.query_devices():
+            if (d["max_input_channels"] > 0 and (api is None or d["hostapi"] == api)
+                    and d["name"] not in names):
+                names.append(d["name"])
+    except Exception:
+        pass
+    return names
+
+
+def resolve_input_device(sd, name):
+    """Имя из настроек -> (индекс или None, имя для показа, примечание)."""
+    note = ""
+    if name and name != DEFAULT_DEVICE:
+        for i, d in enumerate(sd.query_devices()):
+            if d["name"] == name and d["max_input_channels"] > 0:
+                return i, d["name"], ""
+        note = f"Микрофон «{name}» не найден — использую системный по умолчанию."
+    return None, sd.query_devices(kind="input")["name"], note
+
+
+def pick_input_format(sd, dev):
+    """Частота и число каналов, которые устройство точно примет. Сначала родная
+    частота устройства (как в официальном примере Vosk): распознаватель Vosk
+    принимает любую частоту и сам ресемплирует."""
+    info = sd.query_devices(dev, "input")
+    rates = []
+    for r in (int(info["default_samplerate"]), 16000, 48000, 44100):
+        if r > 0 and r not in rates:
+            rates.append(r)
+    chans = [1] + ([2] if info["max_input_channels"] >= 2 else [])
+    err = None
+    for ch in chans:
+        for r in rates:
+            try:
+                sd.check_input_settings(device=dev, channels=ch, dtype="int16", samplerate=r)
+                return r, ch
+            except Exception as e:
+                err = e
+    raise RuntimeError(f"«{info['name']}» не принимает ни один формат записи ({err})")
+
+
+def _wake_main(gen, stop_ev):
+    def report(**kv):
+        if _wake["gen"] != gen:
+            return  # поток уже заменён новым
+        if "phase" in kv and kv["phase"] != WAKE_STATE.get("phase"):
+            extra = kv.get("info") or ""
+            print(f"[wake] {kv['phase']} {extra}".rstrip(), flush=True)
+        WAKE_STATE.update(kv)
+
+    def get_cfg():
+        return _wake["cfg"]
+
+    report(phase="starting", info="", warn="", note="", heard="", device="", silent=False)
     try:
         import sounddevice as sd
     except Exception as e:
-        WAKE_EVENTS.put(("status", f"sounddevice недоступен: {e}"))
-        return
+        return report(phase="error", info=f"Не загрузился sounddevice: {e}")
+    try:
+        load_stt()
+    except Exception as e:
+        return report(phase="error", info=f"Модель распознавания не загрузилась: {e}")
+    try:
+        dev, dev_name, note = resolve_input_device(sd, get_cfg().get("wake_device"))
+        sr, ch = pick_input_format(sd, dev)
+    except Exception as e:
+        return report(phase="error", info=f"Микрофон недоступен: {e}")
+
     audio_q = queue.Queue()
 
     def cb(indata, frames, time_info, status):
-        audio_q.put(bytes(indata))
+        data = bytes(indata)
+        if ch > 1:  # стерео -> моно
+            a = np.frombuffer(data, dtype=np.int16).reshape(-1, ch).astype(np.int32)
+            data = (a.sum(axis=1) // ch).astype(np.int16).tobytes()
+        audio_q.put(data)
 
     def read_frame():
-        if _wake["stop"].is_set():
+        if stop_ev.is_set():
             return None
         try:
             return audio_q.get(timeout=0.5)
         except queue.Empty:
             return b""
 
-    def play_audio(arr, sr):
-        sd.play(arr, sr)
-        sd.wait()
-
-    def process(text):
-        answer, wav = answer_and_speak(text, cfg)
-        WAKE_EVENTS.put(("exchange", (text, answer, wav)))
-        data, sr = sf.read(wav, dtype="float32", always_2d=True)
-        play_audio(data, sr)
-
     def flush():
-        while not audio_q.empty():
+        while True:
             try:
                 audio_q.get_nowait()
             except queue.Empty:
-                break
+                return
+
+    beep_wav = make_beep()
+
+    def beep():
+        try:
+            sd.play(beep_wav, SAMPLE_RATE_TTS)
+            sd.wait()
+        except Exception:
+            pass
+
+    def process(question):
+        answer, wav = answer_and_speak(question, get_cfg())
+        report(phase="speaking", info=f"Ответ: «{answer[:150]}»")
+        data, wav_sr = sf.read(wav, dtype="float32", always_2d=True)
+        sd.play(data, wav_sr)
+        sd.wait()
+        time.sleep(0.3)  # хвост эха из динамиков; затем wake_loop чистит очередь
 
     try:
-        with sd.RawInputStream(samplerate=SAMPLE_RATE_STT, channels=1,
-                               dtype="int16", blocksize=WAKE_FRAME, callback=cb):
-            wake_loop(read_frame, play_audio, process, cfg,
-                      flush=flush, stop=_wake["stop"].is_set)
+        with sd.RawInputStream(samplerate=sr, blocksize=int(sr * 0.1), device=dev,
+                               channels=ch, dtype="int16", callback=cb):
+            report(device=f"{dev_name} · {sr} Гц" + (f" · {ch} кан." if ch > 1 else ""),
+                   note=note)
+            wake_loop(read_frame, sr, process, get_cfg, beep=beep, flush=flush,
+                      stop=stop_ev.is_set, report=report,
+                      muted=lambda: time.time() < MUTE_UNTIL[0])
     except Exception as e:
-        WAKE_EVENTS.put(("status", f"Wake word остановлен: {e}"))
+        report(phase="error", info=f"Ошибка микрофона: {e}")
 
 
-def start_wake(cfg):
+def start_wake():
     stop_wake()
-    _wake["stop"].clear()
-    t = threading.Thread(target=_wake_main, args=(dict(cfg),), daemon=True)
+    ev = threading.Event()
+    _wake["gen"] += 1
+    _wake["stop"] = ev
+    t = threading.Thread(target=_wake_main, args=(_wake["gen"], ev), daemon=True)
     _wake["thread"] = t
     t.start()
 
 
 def stop_wake():
-    _wake["stop"].set()
+    if _wake["stop"] is not None:
+        _wake["stop"].set()
     t = _wake["thread"]
     if t and t.is_alive():
-        t.join(timeout=5)
-    _wake["thread"] = None
+        t.join(timeout=3)
+    _wake["thread"] = _wake["stop"] = None
+    _wake["gen"] += 1  # отчёты старого потока больше не принимаются
+    WAKE_STATE.update(phase="off", info="", heard="", level=-90.0, silent=False)
+
+
+PHASE_TEXT = {
+    "off": "⚪ Wake word выключен",
+    "starting": "⏳ Запускаю микрофон и распознавание…",
+    "waiting": "🟢 Жду wake word {wake}",
+    "listening": "🟡 Слушаю вопрос…",
+    "thinking": "🧠 Думаю…",
+    "speaking": "🔊 Отвечаю…",
+    "error": "🔴 Wake word не работает",
+}
+
+
+def render_wake_status():
+    st = dict(WAKE_STATE)
+    phase = st.get("phase", "off")
+    lines = ["**" + PHASE_TEXT.get(phase, phase).format(wake=st.get("wake") or "") + "**"]
+    if phase == "off":
+        return lines[0]
+    if st.get("device"):
+        lines.append(f"🎙 {st['device']}")
+    if phase not in ("starting", "error"):
+        lvl = float(st.get("level", -90.0))
+        n = int(round(max(0.0, min(1.0, (lvl + 70.0) / 60.0)) * 20))
+        lines.append(f"Уровень: `{'█' * n}{'░' * (20 - n)}` {lvl:.0f} дБ")
+        if st.get("heard"):
+            lines.append(f"Слышу: «{st['heard'][-100:]}»")
+    for key in ("note", "warn"):
+        if st.get(key):
+            lines.append("⚠️ " + st[key])
+    if st.get("silent") and phase in ("waiting", "listening"):
+        lines.append("⚠️ С микрофона идёт полная тишина (уровень не растёт, даже если говорить?). "
+                     "Выберите другой микрофон в списке или включите в Windows: Параметры → "
+                     "Конфиденциальность → Микрофон → «Разрешить классическим приложениям "
+                     "доступ к микрофону».")
+    if st.get("info"):
+        lines.append(st["info"])
+    return "  \n".join(lines)
 
 
 # ----------------------------- UI-обработчики --------------------------------
 
 SETTING_FIELDS = ["voice", "llm_source", "hf_repo", "hf_file", "local_gguf_path",
-                  "litellm_base", "litellm_key", "litellm_model", "n_ctx", "wake_word"]
+                  "litellm_base", "litellm_key", "litellm_model", "n_ctx",
+                  "wake_word", "wake_enabled", "wake_device"]
 
 
 def make_cfg(*values):
-    return dict(zip(SETTING_FIELDS, values))
+    cfg = dict(DEFAULT_SETTINGS)
+    cfg.update(zip(SETTING_FIELDS, values))
+    return cfg
+
+
+def apply_settings(*cfg_values):
+    """Сохранить в settings.json и сразу отдать слушателю wake word."""
+    cfg = make_cfg(*cfg_values)
+    save_settings(cfg)
+    _wake["cfg"] = cfg
+    return cfg
 
 
 def respond(audio_path, text_input, *cfg_values, progress=gr.Progress()):
-    cfg = make_cfg(*cfg_values)
-    save_settings(cfg)
+    cfg = apply_settings(*cfg_values)
     try:
         user_text = (text_input or "").strip()
         if not user_text:
@@ -498,48 +746,61 @@ def respond(audio_path, text_input, *cfg_values, progress=gr.Progress()):
             return None, "Ничего не расслышал — попробуйте ещё раз.", ""
         progress(0.35, desc="Думаю (первый запуск скачает модель, это долго)...")
         answer, wav = answer_and_speak(user_text, cfg)
+        # ответ сейчас зазвучит из браузера — wake word не должен слушать сам себя
+        MUTE_UNTIL[0] = time.time() + sf.info(wav).duration + 1.5
         progress(0.9, desc="Готово")
         return wav, render_log(), ""
     except Exception as e:
         return None, f"Ошибка: {e}", ""
 
 
-def toggle_wake(enabled, *cfg_values):
-    cfg = make_cfg(*cfg_values)
-    save_settings(cfg)
-    if enabled:
-        start_wake(cfg)
-        return f"Включаю… wake word «{cfg['wake_word']}» (микрофон этого компьютера)"
-    stop_wake()
-    return "Wake word выключен"
+def on_wake_toggle(*cfg_values):
+    cfg = apply_settings(*cfg_values)
+    if cfg["wake_enabled"]:
+        start_wake()
+    else:
+        stop_wake()
+    return render_wake_status()
 
 
-def poll_wake():
-    out_audio, status, log = None, None, None
-    while True:
-        try:
-            kind, payload = WAKE_EVENTS.get_nowait()
-        except queue.Empty:
-            break
-        if kind == "status":
-            status = payload
-        elif kind == "exchange":
-            _, _, wav = payload
-            out_audio, log = wav, render_log()
+def on_device_change(*cfg_values):
+    cfg = apply_settings(*cfg_values)
+    if cfg["wake_enabled"]:
+        start_wake()  # перезапуск с новым микрофоном
+    return render_wake_status()
+
+
+def refresh_devices():
+    t = _wake["thread"]
+    if not (t and t.is_alive()):
+        try:  # перечитать список устройств (новый USB-микрофон и т.п.)
+            import sounddevice as sd
+            sd._terminate()
+            sd._initialize()
+        except Exception:
+            pass
+    return gr.Dropdown(choices=list_input_devices())
+
+
+def poll_ui(seen):
+    """Таймер: живой статус wake word + диалог, если он изменился."""
+    seen = seen or {}
+    status, ver = render_wake_status(), HISTORY_VER[0]
     return (
-        out_audio if out_audio else gr.skip(),
-        log if log is not None else gr.skip(),
-        status if status is not None else gr.skip(),
+        status if status != seen.get("status") else gr.skip(),
+        render_log() if ver != seen.get("ver") else gr.skip(),
+        {"status": status, "ver": ver},
     )
 
 
 def autosave(*cfg_values):
-    save_settings(make_cfg(*cfg_values))
+    apply_settings(*cfg_values)
 
 
 def clear_history():
     with HISTORY_LOCK:
         HISTORY.clear()
+        HISTORY_VER[0] += 1
     return ""
 
 
@@ -547,6 +808,9 @@ def clear_history():
 
 def build_ui():
     s = load_settings()
+    devices = list_input_devices()
+    if s["wake_device"] not in devices:
+        devices.append(s["wake_device"])
     with gr.Blocks(title="RU Voice Assistant") as demo:
         gr.Markdown(
             "# 🎙️ RU Voice Assistant\n"
@@ -578,38 +842,51 @@ def build_ui():
             text_input = gr.Textbox(label="…или вопрос текстом",
                                     placeholder="Напишите и нажмите Enter",
                                     submit_btn=True)
-        with gr.Row():
-            voice = gr.Dropdown(VOICES, value=s["voice"], label="Голос ассистента")
-            wake_enabled = gr.Checkbox(value=bool(s["wake_enabled"]),
-                                       label="🔔 Wake word (системный микрофон)")
-            wake_word = gr.Textbox(label="Wake word", value=s["wake_word"])
-        wake_status = gr.Markdown("Wake word выключен")
+        voice = gr.Dropdown(VOICES, value=s["voice"], label="Голос ассистента")
+        with gr.Accordion("🔔 Голосовая активация (wake word)", open=True):
+            with gr.Row(equal_height=True):
+                wake_enabled = gr.Checkbox(value=bool(s["wake_enabled"]), scale=1,
+                                           label="Слушать микрофон компьютера")
+                wake_word = gr.Textbox(label="Wake word — можно несколько через запятую",
+                                       value=s["wake_word"], scale=2)
+                wake_device = gr.Dropdown(devices, value=s["wake_device"], scale=2,
+                                          label="Микрофон (🔄 — обновить список)",
+                                          allow_custom_value=True)
+                refresh = gr.Button("🔄", scale=0, min_width=48)
+            wake_status = gr.Markdown(render_wake_status())
+            gr.Markdown("Скажите одной фразой «Ассистент, какая погода?» — или скажите "
+                        "«Ассистент», дождитесь сигнала и задайте вопрос.")
         with gr.Row():
             clear = gr.Button("🗑 Сбросить диалог")
         reply = gr.Audio(label="Ответ (озвучка)", type="filepath", autoplay=True)
         log = gr.Textbox(label="Диалог", lines=10)
+        seen = gr.State({})
 
-        cfg_inputs = [voice, mode, hf_repo, hf_file, local_gguf,
-                      base_url, api_key, model_name, n_ctx, wake_word]
+        cfg_inputs = [voice, mode, hf_repo, hf_file, local_gguf, base_url, api_key,
+                      model_name, n_ctx, wake_word, wake_enabled, wake_device]
         respond_inputs = [audio, text_input] + cfg_inputs
         respond_outputs = [reply, log, text_input]
 
         text_input.submit(respond, inputs=respond_inputs, outputs=respond_outputs)
         audio.stop_recording(respond, inputs=respond_inputs, outputs=respond_outputs)
-        wake_enabled.change(toggle_wake, inputs=[wake_enabled] + cfg_inputs,
-                            outputs=[wake_status])
+        wake_enabled.change(on_wake_toggle, inputs=cfg_inputs, outputs=[wake_status])
+        wake_device.change(on_device_change, inputs=cfg_inputs, outputs=[wake_status])
+        refresh.click(refresh_devices, outputs=[wake_device])
         for comp in cfg_inputs:
-            comp.change(autosave, inputs=cfg_inputs, outputs=[])
+            if comp not in (wake_enabled, wake_device):
+                comp.change(autosave, inputs=cfg_inputs, outputs=[])
         clear.click(clear_history, outputs=[log])
 
-        timer = gr.Timer(1.0)
-        timer.tick(poll_wake, outputs=[reply, log, wake_status])
+        timer = gr.Timer(0.5)
+        timer.tick(poll_ui, inputs=[seen], outputs=[wake_status, log, seen],
+                   show_progress="hidden")
     return demo
 
 
 if __name__ == "__main__":
+    settings = load_settings()
+    _wake["cfg"] = settings
     app = build_ui()
-    s = load_settings()
-    if s.get("wake_enabled"):
-        start_wake(s)
+    if settings.get("wake_enabled"):
+        start_wake()
     app.launch(inbrowser=True, server_name="127.0.0.1", server_port=7861)
