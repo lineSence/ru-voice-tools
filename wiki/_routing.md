@@ -5,9 +5,19 @@
 ```yaml
 triggers:
   - id: stt
-    keywords: [vosk, stt, распознавание, микрофон, whisper, аудио-вход, 16000, wake word, sounddevice]
+    keywords: [vosk, stt, распознавание, микрофон, аудио-вход, 16000, wake word, sounddevice]
     load:
       - wiki/rules/stt-vosk.md
+      - wiki/references/models.md
+  - id: whisper
+    keywords: [whisper, английские слова, ggml, turbo, transcribe, промпт распознавания, галлюцинации]
+    load:
+      - wiki/rules/stt-whisper.md
+      - wiki/rules/engine-kobold.md
+  - id: engine
+    keywords: [koboldcpp, kobold, vulkan, gpu, видеокарта, rx 580, 5011, движок, gpulayers]
+    load:
+      - wiki/rules/engine-kobold.md
       - wiki/references/models.md
   - id: tts
     keywords: [silero, tts, синтез, озвучка, голос, aidar, kseniya, ударение]
@@ -15,7 +25,7 @@ triggers:
       - wiki/rules/tts-silero.md
       - wiki/references/models.md
   - id: llm
-    keywords: [llm, gguf, qwen, gemma, litellm, llama-cpp, ollama, модель, промпт]
+    keywords: [llm, gguf, qwen, gemma, litellm, llama-cpp, ollama, модель, промпт, think]
     load:
       - wiki/rules/llm-local.md
       - wiki/references/models.md
@@ -29,7 +39,7 @@ triggers:
       - wiki/rules/packaging.md
       - wiki/workflows/release.md
   - id: arch
-    keywords: [архитектура, пайплайн, структура, порты, кэш]
+    keywords: [архитектура, пайплайн, структура, порты, кэш, engine/]
     load:
       - wiki/architecture/overview.md
   - id: sek

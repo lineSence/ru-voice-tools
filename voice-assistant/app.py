@@ -3,14 +3,17 @@
 """
 RU Voice Assistant — локальный голосовой ассистент на русском.
 
-STT : Vosk (русская модель, скачивается автоматически, ~45 МБ)
-LLM : любая GGUF (Hugging Face repo+file или локальный .gguf) через llama-cpp-python,
-      либо OpenAI-совместимый endpoint (LiteLLM-прокси)
-TTS : Silero v5 (скачивается автоматически, ~140 МБ)
-Wake word: Vosk расшифровывает микрофон компьютера (sounddevice), слово-триггер
-           ищется в тексте нечётко; вопрос — та же фраза после него или следующая
+Распознавание: Whisper large-v3-turbo — понимает английские слова внутри русской
+               речи («MIDI», «Python», «USB»); либо Vosk — быстрее, но только русский словарь
+LLM          : любая GGUF (Hugging Face repo+file или локальный .gguf),
+               либо OpenAI-совместимый endpoint (LiteLLM-прокси)
+Движок       : KoboldCpp (скачивается сам) — LLM и Whisper на видеокарте через Vulkan
+               (AMD/NVIDIA/Intel, CUDA не нужна) или на процессоре
+TTS          : Silero v5; английские слова и числа переводятся в русское чтение
+Wake word    : Vosk слушает микрофон компьютера и ищет слово-триггер, сам вопрос
+               дораспознаёт Whisper
 
-Всё работает на CPU, GPU не требуется. Настройки автосохраняются в settings.json.
+Настройки автосохраняются в settings.json.
 """
 
 import os
@@ -20,13 +23,20 @@ import os
 os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 
+import atexit
+import base64
+import collections
 import difflib
-import gc
+import hashlib
 import inspect
+import io
 import json
 import math
+import platform
 import queue
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -46,7 +56,22 @@ VOICES = ["aidar", "baya", "kseniya", "xenia", "eugene", "random"]
 SRC_HF = "Hugging Face GGUF"
 SRC_LOCAL = "Локальный файл .gguf"
 SRC_LITELLM = "LiteLLM-прокси (облако)"
+STT_WHISPER = "Whisper — понимает английские слова"
+STT_VOSK = "Vosk — быстрее, только русские слова"
+COMPUTE_GPU = "Видеокарта (Vulkan)"
+COMPUTE_CPU = "Только процессор"
 DEFAULT_DEVICE = "Системный по умолчанию"
+
+WHISPER_REPO = "ggerganov/whisper.cpp"
+WHISPER_MODELS = [
+    "ggml-large-v3-turbo-q5_0.bin",  # 574 МБ — лучший выбор для видеокарты
+    "ggml-large-v3-turbo-q8_0.bin",  # 874 МБ
+    "ggml-large-v3-turbo.bin",       # 1.6 ГБ
+    "ggml-medium-q5_0.bin",          # 539 МБ
+    "ggml-small-q8_0.bin",           # 264 МБ — быстро на процессоре, но хуже с английскими словами
+]
+DEFAULT_WHISPER_PROMPT = ("Вопросы голосовому ассистенту на русском, с английскими терминами: "
+                          "MIDI, USB, Python, Windows, GitHub, Docker, YouTube, Bluetooth, Wi-Fi, VST.")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
@@ -64,6 +89,12 @@ DEFAULT_SETTINGS = {
     "wake_enabled": False,
     "wake_word": "ассистент",
     "wake_device": DEFAULT_DEVICE,
+    "stt_engine": STT_WHISPER,
+    "compute": COMPUTE_GPU,
+    "whisper_model": WHISPER_MODELS[0],
+    "whisper_prompt": DEFAULT_WHISPER_PROMPT,
+    "gpu_layers": -1,
+    "kobold_path": "",  # необязательно: свой koboldcpp(.exe) вместо скачиваемого
 }
 
 SYSTEM_PROMPT = (
@@ -77,7 +108,6 @@ MAX_TOKENS = 220
 HISTORY_KEEP = 6  # пар реплик
 
 _stt = {"model": None}
-_llm = {"key": None, "obj": None}
 _tts = {"model": None}
 
 HISTORY = []
@@ -88,6 +118,13 @@ PIPE_LOCK = threading.Lock()
 
 # ----------------------------- Настройки ------------------------------------
 
+def _int(v, default):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
 def load_settings():
     s = dict(DEFAULT_SETTINGS)
     try:
@@ -95,6 +132,11 @@ def load_settings():
             s.update(json.load(f))
     except Exception:
         pass
+    if s.get("stt_engine") not in (STT_WHISPER, STT_VOSK):
+        s["stt_engine"] = STT_WHISPER
+    if s.get("compute") not in (COMPUTE_GPU, COMPUTE_CPU):
+        s["compute"] = COMPUTE_GPU
+    s["gpu_layers"] = _int(s.get("gpu_layers"), -1)
     return s
 
 
@@ -195,50 +237,593 @@ def to_16k_mono_int16(audio_path):
     return (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
 
 
-def transcribe(audio_path):
-    """wav-файл -> текст (Vosk)."""
-    model = load_stt()
-    pcm = to_16k_mono_int16(audio_path).tobytes()
-    rec = vosk.KaldiRecognizer(model, SAMPLE_RATE_STT)
+def resample_int16(pcm, sr, target=SAMPLE_RATE_STT):
+    if int(sr) == target:
+        return pcm
+    g = math.gcd(int(sr), target)
+    y = signal.resample_poly(pcm.astype(np.float32), target // g, int(sr) // g)
+    return np.clip(y, -32768, 32767).astype(np.int16)
+
+
+def vosk_pcm(pcm):
+    """int16 моно 16 кГц -> текст (Vosk)."""
+    rec = vosk.KaldiRecognizer(load_stt(), SAMPLE_RATE_STT)
+    data = pcm.tobytes()
     parts = []
-    for i in range(0, len(pcm), 8000):
-        if rec.AcceptWaveform(pcm[i:i + 8000]):
+    for i in range(0, len(data), 8000):
+        if rec.AcceptWaveform(data[i:i + 8000]):
             parts.append(json.loads(rec.Result()).get("text", ""))
     parts.append(json.loads(rec.FinalResult()).get("text", ""))
     return " ".join(p for p in parts if p).strip()
 
 
-# ----------------------------- LLM ------------------------------------------
+# ----------------------------- Движок: KoboldCpp -----------------------------
+#
+# Один процесс KoboldCpp держит и LLM, и Whisper. Сборка nocuda умеет Vulkan —
+# видеокарты AMD (и любые другие) работают без CUDA/ROCm. Скачивается один раз с
+# официальной страницы релизов (sha256 сверяется), распаковывается в engine/ —
+# так запуск быстрый и временная папка не засоряется.
 
-def load_llm(cfg):
-    """GGUF из Hugging Face (repo+file) или локальный файл. Без хардкода моделей."""
-    key = (cfg["llm_source"], cfg["hf_repo"], cfg["hf_file"],
-           cfg["local_gguf_path"], int(cfg["n_ctx"]))
-    if _llm["key"] == key and _llm["obj"] is not None:
-        return _llm["obj"]
-    from llama_cpp import Llama
+KOBOLD_VERSION = "1.122.1"
+KOBOLD_PORT = 5011
+KOBOLD_ASSETS = {  # файл релиза -> sha256 из GitHub API релиза v1.122.1
+    "koboldcpp-nocuda.exe": "c314724e02b310c4db066a8dade8890a1628bc4b65aa9c2b658309219ca7a779",
+    "koboldcpp-linux-x64-nocuda": "5532ead66f460a59c744fc74a45715bf2b0ef2fe2fb05a6c146a6d2df2145d29",
+    "koboldcpp-mac-arm64": "4dc85e7f0414812ec5b1fd810b2009a73844ff17347edac41ff85ffe7fc70412",
+}
+ENGINE_DIR = os.path.join(APP_DIR, "engine")
+ENGINE_LOG = os.path.join(ENGINE_DIR, "koboldcpp.log")
+ENGINE_BASE = f"http://127.0.0.1:{KOBOLD_PORT}"
+ENGINE_STATE = {"phase": "off", "info": "", "warn": "", "device": "", "models": "",
+                "stt_sec": None, "llm_sec": None, "llm_tps": None}
+_eng = {"proc": None, "light": None, "jobs": []}
+ENGINE_LOCK = threading.RLock()
+_HTTP = requests.Session()
+_HTTP.trust_env = False  # к 127.0.0.1 — всегда напрямую, мимо прокси/VPN
+_HF_PATHS = {}
+
+
+class EngineError(RuntimeError):
+    pass
+
+
+def engine_report(**kv):
+    if "phase" in kv and kv["phase"] != ENGINE_STATE.get("phase"):
+        print(f"[engine] {kv['phase']} {kv.get('info') or ''}".rstrip(), flush=True)
+    ENGINE_STATE.update(kv)
+
+
+def engine_needs(cfg):
+    """(нужна локальная LLM, нужен Whisper)"""
+    return cfg.get("llm_source") in (SRC_HF, SRC_LOCAL), cfg.get("stt_engine") == STT_WHISPER
+
+
+def engine_light_key(cfg):
+    """Всё, что требует перезапуска движка, — без скачиваний и обращений к диску."""
+    need_llm, need_wh = engine_needs(cfg)
+    if not (need_llm or need_wh):
+        return None
+    llm = None
+    if need_llm:
+        src = ((cfg.get("hf_repo") or "").strip(), (cfg.get("hf_file") or "").strip()) \
+            if cfg["llm_source"] == SRC_HF else (cfg.get("local_gguf_path") or "").strip().strip('"')
+        llm = (src, _int(cfg.get("n_ctx"), 4096))
+    gpu = cfg.get("compute") != COMPUTE_CPU
+    return (llm, (cfg.get("whisper_model") or "").strip() if need_wh else None,
+            gpu, _int(cfg.get("gpu_layers"), -1) if gpu else 0)
+
+
+def kobold_asset():
+    sysname, mach = platform.system(), platform.machine().lower()
+    if sysname == "Windows" and mach in ("amd64", "x86_64"):
+        return "koboldcpp-nocuda.exe"
+    if sysname == "Linux" and mach in ("x86_64", "amd64"):
+        return "koboldcpp-linux-x64-nocuda"
+    if sysname == "Darwin" and mach == "arm64":
+        return "koboldcpp-mac-arm64"
+    raise EngineError(f"Для {sysname} {mach} нет готовой сборки KoboldCpp — "
+                      "выберите LiteLLM для ответов и Vosk для распознавания.")
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def _download(url, dest, sha256, label):
+    """Скачивание с докачкой, повторами и прогрессом в статусе GUI."""
+    part = dest + ".part"
+    for attempt in range(3):
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        try:
+            with requests.get(url, stream=True, timeout=(15, 120),
+                              headers={"Range": f"bytes={have}-"} if have else {}) as r:
+                if r.status_code == 416:  # уже скачано целиком
+                    break
+                if have and r.status_code != 206:
+                    have = 0  # сервер не понял Range — качаем заново
+                r.raise_for_status()
+                total = have + int(r.headers.get("Content-Length") or 0)
+                done, shown = have, 0.0
+                with open(part, "ab" if have else "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+                        done += len(chunk)
+                        if time.time() - shown > 0.5:
+                            shown = time.time()
+                            engine_report(info=f"Скачиваю {label}: {done >> 20}"
+                                               + (f" из {total >> 20}" if total else "") + " МБ")
+            break
+        except requests.RequestException as e:
+            if attempt == 2:
+                raise EngineError(f"Не удалось скачать {label}: {e}. Можно вручную: "
+                                  f"{url} -> {dest}")
+            time.sleep(3)
+    if sha256 and _sha256(part) != sha256:
+        os.remove(part)
+        raise EngineError(f"{label}: контрольная сумма не совпала (файл повреждён) — "
+                          "попробуйте ещё раз.")
+    os.replace(part, dest)
+
+
+def _hidden():
+    """Без лишних окон консоли на Windows."""
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
+def ensure_kobold():
+    """Путь к KoboldCpp; при первом запуске — скачать (~120 МБ) и распаковать."""
+    custom = (_wake["cfg"].get("kobold_path") or "").strip().strip('"')
+    if custom:
+        if not os.path.isfile(custom):
+            raise EngineError(f"kobold_path из settings.json не найден: {custom}")
+        return custom
+    asset = kobold_asset()
+    exe = ".exe" if os.name == "nt" else ""
+    unpacked = os.path.join(ENGINE_DIR, f"koboldcpp-{KOBOLD_VERSION}")
+    launcher = os.path.join(unpacked, "koboldcpp-launcher" + exe)
+    if os.path.isfile(launcher):
+        return launcher
+    os.makedirs(ENGINE_DIR, exist_ok=True)
+    single = os.path.join(ENGINE_DIR, asset)
+    if not os.path.isfile(single):
+        engine_report(phase="download", info=f"Скачиваю KoboldCpp {KOBOLD_VERSION}…")
+        _download(f"https://github.com/LostRuins/koboldcpp/releases/download/"
+                  f"v{KOBOLD_VERSION}/{asset}", single, KOBOLD_ASSETS[asset],
+                  f"KoboldCpp {KOBOLD_VERSION}")
+    elif _sha256(single) != KOBOLD_ASSETS[asset]:
+        os.remove(single)
+        raise EngineError(f"{single} не совпадает с официальным релизом — файл удалён, "
+                          "при следующем запуске скачается заново.")
+    if os.name != "nt":
+        os.chmod(single, 0o755)
+    engine_report(phase="starting", info="Распаковываю KoboldCpp (один раз, около минуты)…")
+    tmp = unpacked + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        with open(ENGINE_LOG, "wb") as log:
+            subprocess.run([single, "--unpack", tmp], cwd=ENGINE_DIR, stdin=subprocess.DEVNULL,
+                           stdout=log, stderr=subprocess.STDOUT, timeout=900, **_hidden())
+        if os.path.isfile(os.path.join(tmp, "koboldcpp-launcher" + exe)):
+            os.replace(tmp, unpacked)
+            os.remove(single)
+            return launcher
+    except Exception as e:
+        print(f"[engine] распаковка не удалась ({e}) — запускаю одним файлом", flush=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return single
+
+
+def _watch_hf_download(repo, filename, label, stop):
+    """Прогресс скачивания с Hugging Face — по размеру *.incomplete в кэше."""
+    total = 0
+    try:
+        from huggingface_hub import get_hf_file_metadata, hf_hub_url
+        total = get_hf_file_metadata(hf_hub_url(repo, filename)).size or 0
+    except Exception:
+        pass
+    try:
+        from huggingface_hub import constants
+        blobs = os.path.join(constants.HF_HUB_CACHE, "models--" + repo.replace("/", "--"), "blobs")
+    except Exception:
+        return
+    while not stop.wait(1.0):
+        try:
+            got = sum(os.path.getsize(os.path.join(blobs, f)) for f in os.listdir(blobs)
+                      if f.endswith(".incomplete"))
+        except OSError:
+            continue
+        if got and not stop.is_set():
+            engine_report(info=f"Скачиваю {label}: {got >> 20}"
+                               + (f" из {total >> 20}" if total else "") + " МБ")
+
+
+def hf_file(repo, filename, label):
+    """Файл из Hugging Face (кэш HF): без сети, если уже скачан."""
+    key = (repo, filename)
+    if key in _HF_PATHS and os.path.isfile(_HF_PATHS[key]):
+        return _HF_PATHS[key]
+    from huggingface_hub import hf_hub_download
+    try:
+        path = hf_hub_download(repo_id=repo, filename=filename, local_files_only=True)
+    except Exception:
+        engine_report(phase="download", info=f"Скачиваю {label}…")
+        stop = threading.Event()
+        threading.Thread(target=_watch_hf_download, args=(repo, filename, label, stop),
+                         daemon=True).start()
+        try:
+            path = hf_hub_download(repo_id=repo, filename=filename)
+        except Exception as e:
+            raise EngineError(f"Не удалось скачать {label} ({repo}/{filename}): {e}")
+        finally:
+            stop.set()
+    _HF_PATHS[key] = path
+    return path
+
+
+def resolve_llm_path(cfg):
     if cfg["llm_source"] == SRC_LOCAL:
-        path = cfg["local_gguf_path"].strip().strip('"')
+        path = (cfg.get("local_gguf_path") or "").strip().strip('"')
         if not path or not os.path.isfile(path):
-            raise RuntimeError("Укажите существующий путь к .gguf файлу.")
-    else:
-        from huggingface_hub import hf_hub_download
-        if not cfg["hf_repo"].strip() or not cfg["hf_file"].strip():
-            raise RuntimeError("Укажите репозиторий и имя файла GGUF на Hugging Face.")
-        path = hf_hub_download(repo_id=cfg["hf_repo"].strip(), filename=cfg["hf_file"].strip())
-    if _llm["obj"] is not None:
-        del _llm["obj"]
-        gc.collect()
-    _llm["obj"] = Llama(
-        model_path=path,
-        n_ctx=int(cfg["n_ctx"]),
-        n_threads=max(1, (os.cpu_count() or 4) - 1),
-        n_gpu_layers=0,
-        verbose=False,
-    )
-    _llm["key"] = key
-    return _llm["obj"]
+            raise EngineError("Укажите существующий путь к .gguf файлу.")
+        return path
+    repo, fname = (cfg.get("hf_repo") or "").strip(), (cfg.get("hf_file") or "").strip()
+    if not repo or not fname:
+        raise EngineError("Укажите репозиторий и имя файла GGUF на Hugging Face.")
+    return hf_file(repo, fname, f"модель {fname}")
 
+
+def resolve_whisper_path(cfg):
+    """Имя файла из ggerganov/whisper.cpp, «владелец/репозиторий/файл» или путь к .bin."""
+    name = (cfg.get("whisper_model") or WHISPER_MODELS[0]).strip().strip('"')
+    if os.path.isfile(name):
+        return name
+    if os.path.isabs(name) or "\\" in name or ":" in name:
+        raise EngineError(f"Файл модели Whisper не найден: {name}")
+    parts = name.split("/")
+    repo, fname = ("/".join(parts[:2]), "/".join(parts[2:])) if len(parts) >= 3 \
+        else (WHISPER_REPO, name)
+    return hf_file(repo, fname, f"Whisper {os.path.basename(fname)}")
+
+
+def _ascii_path(path):
+    """C++-часть KoboldCpp открывает файлы «узкими» строками: на Windows путь с
+    кириллицей (C:\\Users\\Иван\\...) может не открыться. Короткое имя 8.3 — латиницей."""
+    if os.name != "nt" or path.isascii():
+        return path
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 32768)
+        if 0 < n < 32768 and buf.value.isascii():
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+
+def _kill_with_us(proc):
+    """Windows: KoboldCpp завершится вместе с ассистентом, даже если окно консоли
+    закрыли крестиком, — иначе он остался бы висеть и держать видеопамять."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic),
+                        ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        job = k32.CreateJobObjectW(None, None)
+        info = Extended()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if job and k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)) \
+                and k32.AssignProcessToJobObject(job, int(proc._handle)):
+            _eng["jobs"].append(job)  # дескриптор живёт, пока жив ассистент
+    except Exception as e:
+        print(f"[engine] job object: {e}", flush=True)
+
+
+def _port_busy():
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", KOBOLD_PORT)) == 0
+
+
+def _free_port():
+    """На порту может висеть KoboldCpp от прошлого (аварийно закрытого) запуска — погасить."""
+    if not _port_busy():
+        return
+    try:
+        _HTTP.post(ENGINE_BASE + "/api/extra/shutdown", json={}, timeout=5)
+    except requests.RequestException:
+        pass
+    for _ in range(60):
+        if not _port_busy():
+            return
+        time.sleep(0.25)
+    raise EngineError(f"Порт {KOBOLD_PORT} занят другой программой — закройте её "
+                      "и нажмите «Перезапустить движок».")
+
+
+def _read_log(limit=400_000):
+    try:
+        with open(ENGINE_LOG, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _log_excerpt():
+    """Строки с ошибками из лога KoboldCpp (или его хвост)."""
+    lines = [ln.strip() for ln in _read_log(2_000_000).splitlines()
+             if ln.strip() and len(ln) < 400 and not ln.startswith("Namespace(")]
+    bad = [ln for ln in lines
+           if re.search(r"\b(error|failed|failure|cannot|could not|exception|traceback)\b", ln, re.I)]
+    return " | ".join((bad or lines)[-3:])[-600:]
+
+
+def _launch(launcher, llm_path, wh_path, gpu, layers, n_ctx):
+    """Запустить KoboldCpp и дождаться готовности. False — процесс завершился сам."""
+    args = [_ascii_path(launcher), "--port", str(KOBOLD_PORT), "--host", "127.0.0.1",
+            "--skiplauncher", "--quiet", "--singleinstance"]
+    if llm_path:
+        args += ["--model", _ascii_path(llm_path), "--contextsize", str(n_ctx)]
+    if wh_path:
+        args += ["--whispermodel", _ascii_path(wh_path)]
+    if gpu:
+        args += ["--usevulkan"] + (["--gpulayers", str(layers)] if layers >= 0 else [])
+    else:
+        args += ["--usecpu"]
+    os.makedirs(ENGINE_DIR, exist_ok=True)
+    with open(ENGINE_LOG, "wb") as log:
+        log.write((" ".join(args) + "\n\n").encode("utf-8", "replace"))
+        log.flush()
+        proc = subprocess.Popen(args, cwd=os.path.dirname(launcher) or None,
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                **_hidden())
+    _eng["proc"] = proc
+    _kill_with_us(proc)
+    t0 = time.time()
+    while time.time() - t0 < 900:
+        if proc.poll() is not None:
+            return False
+        try:
+            if _HTTP.get(ENGINE_BASE + "/api/extra/version", timeout=2).ok:
+                return True
+        except requests.RequestException:
+            pass
+        engine_report(info=f"Загружаю модели{' в видеопамять' if gpu else ''}… "
+                           f"{time.time() - t0:.0f} с")
+        time.sleep(0.5)
+    stop_engine(report=False)
+    raise EngineError("KoboldCpp не запустился за 15 минут — см. engine/koboldcpp.log")
+
+
+def _describe_device(gpu, has_llm):
+    """Что реально считает: по логу KoboldCpp -> (строка для GUI, предупреждение)."""
+    if not gpu:
+        return "процессор (CPU)", ""
+    text = _read_log(2_000_000)
+    names = re.findall(r"using device Vulkan\d+ \(([^)]+)\)", text) \
+        or re.findall(r"ggml_vulkan: \d+ = ([^(|\n]+?)\s*\(", text)
+    off = re.findall(r"offloaded (\d+)/(\d+) layers to GPU", text)
+    if names:
+        desc = "видеокарта " + ", ".join(dict.fromkeys(n.strip() for n in names)) + " (Vulkan)"
+        if has_llm and off:
+            desc += f" · слоёв LLM на видеокарте: {off[-1][0]} из {off[-1][1]}"
+        return desc, ""
+    if re.search(r"Backend \d+: Vulkan|Vulkan\d+ (model|compute|KV) buffer", text):
+        return "видеокарта (Vulkan)", ""
+    if has_llm:
+        return "процессор (CPU)", ("Vulkan не нашёл видеокарту — всё считается на процессоре. "
+                                  "Обновите драйвер видеокарты (AMD Adrenalin); "
+                                  "подробности — engine/koboldcpp.log.")
+    return "видеокарта (Vulkan) — Whisper", ""
+
+
+def stop_engine(report=True):
+    with ENGINE_LOCK:
+        proc, _eng["proc"], _eng["light"] = _eng["proc"], None, None
+        if proc is not None and proc.poll() is None:
+            try:  # штатно: так KoboldCpp сам освобождает видеопамять и временные файлы
+                _HTTP.post(ENGINE_BASE + "/api/extra/shutdown", json={}, timeout=3)
+            except requests.RequestException:
+                pass
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        if report:
+            engine_report(phase="off", info="", warn="", device="", models="")
+
+
+def _stop_engine_at_exit():
+    proc = _eng["proc"]
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        _HTTP.post(ENGINE_BASE + "/api/extra/shutdown", json={}, timeout=2)
+        proc.wait(timeout=6)
+    except Exception:
+        proc.kill()
+
+
+def ensure_engine(cfg):
+    """Поднять KoboldCpp под текущие настройки (или убедиться, что он такой) -> base URL."""
+    need_llm, need_wh = engine_needs(cfg)
+    if not (need_llm or need_wh):
+        raise EngineError("Локальный движок не нужен при текущих настройках.")
+    with ENGINE_LOCK:
+        light = engine_light_key(cfg)
+        proc = _eng["proc"]
+        if proc is not None and proc.poll() is None and _eng["light"] == light:
+            return ENGINE_BASE
+        try:
+            launcher = ensure_kobold()
+            llm_path = resolve_llm_path(cfg) if need_llm else ""
+            wh_path = resolve_whisper_path(cfg) if need_wh else ""
+            if proc is not None and proc.poll() is not None:
+                print(f"[engine] KoboldCpp завершился (код {proc.returncode}): {_log_excerpt()}",
+                      flush=True)
+            # после падения с теми же настройками время последнего вопроса остаётся в строке
+            times = {} if _eng["light"] == light else dict(stt_sec=None, llm_sec=None, llm_tps=None)
+            stop_engine(report=False)
+            _free_port()
+            gpu = cfg.get("compute") != COMPUTE_CPU
+            layers, n_ctx = _int(cfg.get("gpu_layers"), -1), _int(cfg.get("n_ctx"), 4096)
+            models = " + ".join(
+                ([os.path.basename(llm_path)] if llm_path else [])
+                + ([f"Whisper {os.path.basename(wh_path)}"] if wh_path else []))
+            engine_report(phase="starting", info="Запускаю KoboldCpp…", warn="", device="",
+                          models=models, **times)
+            ok, warn = _launch(launcher, llm_path, wh_path, gpu, layers, n_ctx), ""
+            if not ok and gpu:  # драйвер Vulkan упал — не оставляем без ассистента
+                why = _log_excerpt()
+                try:
+                    shutil.copyfile(ENGINE_LOG, os.path.join(ENGINE_DIR, "koboldcpp-vulkan-fail.log"))
+                except OSError:
+                    pass
+                print(f"[engine] Vulkan не запустился: {why}", flush=True)
+                warn = ("Видеокарта (Vulkan) не запустилась — работаю на процессоре. "
+                        "Подробности: engine/koboldcpp-vulkan-fail.log")
+                gpu = False
+                engine_report(info="Vulkan не запустился — пробую на процессоре…")
+                ok = _launch(launcher, llm_path, wh_path, False, 0, n_ctx)
+            if not ok:
+                raise EngineError("KoboldCpp не запустился: " + _log_excerpt()
+                                  + " (полный лог: engine/koboldcpp.log)")
+            _eng["light"] = light
+            device, warn2 = _describe_device(gpu, bool(llm_path))
+            engine_report(phase="ready", info="", device=device, warn=warn or warn2)
+            return ENGINE_BASE
+        except Exception as e:
+            engine_report(phase="error", info=str(e))
+            raise
+
+
+def engine_post(cfg, path, payload, timeout):
+    """POST в KoboldCpp; если он упал — один перезапуск и повтор."""
+    for attempt in (1, 2):
+        base = ensure_engine(cfg)
+        try:
+            r = _HTTP.post(base + path, json=payload, timeout=timeout)
+        except (requests.ConnectionError, requests.exceptions.ChunkedEncodingError):
+            proc = _eng["proc"]
+            if attempt == 2 or (proc is not None and proc.poll() is None):
+                raise EngineError("KoboldCpp не отвечает — см. engine/koboldcpp.log")
+            engine_report(phase="error", info="KoboldCpp упал — перезапускаю…")
+            continue
+        if r.status_code != 200:
+            raise EngineError(f"KoboldCpp вернул ошибку {r.status_code}: {r.text[:200]}")
+        return r.json()
+
+
+def engine_bg(restart=False):
+    """Фоном привести движок к текущим настройкам: старт программы, смена режима, кнопка."""
+    def run():
+        with ENGINE_LOCK:  # берём настройки, когда до нас дошла очередь, — самые свежие
+            cfg = _wake["cfg"]
+            try:
+                if restart:
+                    stop_engine()
+                if any(engine_needs(cfg)):
+                    ensure_engine(cfg)
+                else:
+                    stop_engine()
+            except Exception as e:
+                print(f"[engine] {e}", flush=True)
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ----------------------------- Whisper ---------------------------------------
+
+WHISPER_JUNK = re.compile(
+    r"субтитр|продолжение следует|спасибо за (просмотр|внимание)|подписывайтесь|ставьте лайк|"
+    r"dimatorzok|редактор|корректор|amara\.org", re.I)
+
+
+def _norm_text(s):
+    return " ".join(re.findall(r"\w+", (s or "").lower().replace("ё", "е")))
+
+
+def clean_whisper(text, prompt=""):
+    """Убрать типичные «галлюцинации» Whisper на тишине и шуме."""
+    t = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", text or "")  # [музыка], (смеётся)
+    t = re.sub(r"\s+", " ", t).strip(" -—–")
+    n = _norm_text(t)
+    if not n:
+        return ""
+    if len(t) < 80 and WHISPER_JUNK.search(t):
+        return ""
+    if len(n) > 10 and n in _norm_text(prompt):
+        return ""  # Whisper повторил подсказку вместо речи
+    return t
+
+
+def whisper_pcm(pcm16, cfg):
+    """int16 моно 16 кГц -> текст (Whisper в KoboldCpp)."""
+    pad = int(SAMPLE_RATE_STT * 1.2) - pcm16.size  # короче секунды whisper.cpp не распознаёт
+    if pad > 0:
+        pcm16 = np.concatenate([pcm16, np.zeros(pad, np.int16)])
+    buf = io.BytesIO()
+    sf.write(buf, pcm16, SAMPLE_RATE_STT, format="WAV", subtype="PCM_16")
+    prompt = (cfg.get("whisper_prompt") or "").strip()
+    ensure_engine(cfg)
+    t0 = time.time()
+    data = engine_post(cfg, "/api/extra/transcribe", {
+        "audio_data": base64.b64encode(buf.getvalue()).decode("ascii"),
+        "langcode": "ru", "prompt": prompt, "suppress_non_speech": True}, timeout=600)
+    ENGINE_STATE["stt_sec"] = time.time() - t0
+    text = clean_whisper(data.get("text", ""), prompt)
+    print(f"[whisper] {ENGINE_STATE['stt_sec']:.1f} с: {text}", flush=True)
+    return text
+
+
+def transcribe(audio_path, cfg=None):
+    """Запись из браузера -> текст: Whisper (если выбран), при сбое — Vosk."""
+    pcm = to_16k_mono_int16(audio_path)
+    if cfg and cfg.get("stt_engine") == STT_WHISPER:
+        try:
+            text = whisper_pcm(pcm, cfg)
+            if text:
+                return text
+        except Exception as e:
+            print(f"[whisper] не сработал, распознаю Vosk: {e}", flush=True)
+    return vosk_pcm(pcm)
+
+
+# ----------------------------- LLM ------------------------------------------
 
 def build_messages(history, user_text):
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -247,11 +832,26 @@ def build_messages(history, user_text):
     return msgs
 
 
+def strip_think(text):
+    """Рассуждения «думающих» моделей (<think>…</think>) вслух не читаем."""
+    text = re.sub(r"<think>.*?</think>", " ", text or "", flags=re.S)
+    text = re.sub(r"^.*?</think>", " ", text, flags=re.S)
+    return text.strip()
+
+
 def answer_local(cfg, messages):
-    out = load_llm(cfg).create_chat_completion(
-        messages=messages, max_tokens=MAX_TOKENS, temperature=0.6
-    )
-    return out["choices"][0]["message"]["content"].strip()
+    """GGUF через KoboldCpp (видеокарта по Vulkan или процессор)."""
+    ensure_engine(cfg)
+    t0 = time.time()
+    data = engine_post(cfg, "/v1/chat/completions", {
+        "messages": messages, "max_tokens": MAX_TOKENS, "temperature": 0.6}, timeout=600)
+    dt, tps = time.time() - t0, None
+    try:  # скорость генерации без учёта чтения промпта
+        tps = _HTTP.get(ENGINE_BASE + "/api/extra/perf", timeout=2).json().get("last_eval_speed")
+    except (requests.RequestException, ValueError):
+        pass
+    ENGINE_STATE.update(llm_sec=dt, llm_tps=tps or None)
+    return strip_think(data["choices"][0]["message"].get("content") or "")
 
 
 def answer_litellm(cfg, messages):
@@ -266,7 +866,7 @@ def answer_litellm(cfg, messages):
         timeout=180,
     )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    return strip_think(r.json()["choices"][0]["message"]["content"])
 
 
 # ----------------------------- TTS (Silero) ---------------------------------
@@ -287,13 +887,175 @@ def load_tts():
     return _tts["model"]
 
 
+# Silero знает только кириллицу: латиница и цифры молча пропадают
+# («Как установить Python на Windows?» звучало как «Как установить на?»).
+LATIN_WORDS = {
+    # железо и интерфейсы
+    "midi": "миди", "usb": "ю эс би", "hdmi": "эйч ди эм ай", "wi-fi": "вай фай", "wifi": "вай фай",
+    "bluetooth": "блютус", "gpu": "джи пи ю", "cpu": "си пи ю", "ram": "рам", "ssd": "эс эс ди",
+    "hdd": "эйч ди ди", "pc": "пи си", "tv": "ти ви", "amd": "эй эм ди", "nvidia": "энвидиа",
+    "intel": "интел", "radeon": "радеон", "geforce": "джифорс", "ryzen": "райзен",
+    "rtx": "ар ти икс", "gtx": "джи ти икс", "rx": "ар икс", "vulkan": "вулкан", "cuda": "куда",
+    "driver": "драйвер", "bios": "биос", "router": "роутер", "audio": "аудио", "video": "видео",
+    # системы, сервисы, программы
+    "windows": "виндоус", "linux": "линукс", "ubuntu": "убунту", "android": "андроид",
+    "ios": "ай оу эс", "macos": "мак оу эс", "mac": "мак", "apple": "эпл", "iphone": "айфон",
+    "ipad": "айпад", "google": "гугл", "microsoft": "майкрософт", "office": "офис", "word": "ворд",
+    "excel": "эксель", "powerpoint": "пауэрпойнт", "chrome": "хром", "firefox": "файрфокс",
+    "edge": "эдж", "opera": "опера", "yandex": "яндекс", "telegram": "телеграм",
+    "whatsapp": "вотсап", "discord": "дискорд", "zoom": "зум", "skype": "скайп",
+    "youtube": "ютуб", "twitch": "твич", "steam": "стим", "tiktok": "тикток",
+    "instagram": "инстаграм", "facebook": "фейсбук", "twitter": "твиттер", "spotify": "спотифай",
+    "netflix": "нетфликс", "photoshop": "фотошоп", "adobe": "адоби", "premiere": "премьер",
+    "blender": "блендер", "obs": "о би эс", "minecraft": "майнкрафт", "xbox": "икс бокс",
+    "playstation": "плейстейшен", "nintendo": "нинтендо",
+    # музыка и звук
+    "vst": "ви эс ти", "daw": "дау", "fl": "эф эл", "studio": "студио", "ableton": "эйблтон",
+    "live": "лайв", "cubase": "кьюбейс", "reaper": "рипер", "logic": "лоджик", "asio": "азио",
+    "synth": "синт", "plugin": "плагин", "sampler": "сэмплер", "loop": "луп",
+    # программирование и сеть
+    "python": "пайтон", "java": "джава", "javascript": "джаваскрипт", "html": "эйч ти эм эл",
+    "css": "си эс эс", "sql": "эс кью эл", "json": "джейсон", "api": "эй пи ай",
+    "github": "гитхаб", "git": "гит", "docker": "докер", "pip": "пип", "npm": "эн пи эм",
+    "url": "ю ар эл", "http": "эйч ти ти пи", "https": "эйч ти ти пи эс", "www": "дабл ю",
+    "vpn": "ви пи эн", "ip": "ай пи", "dns": "ди эн эс", "email": "имейл", "e-mail": "имейл",
+    "online": "онлайн", "offline": "офлайн", "ok": "окей", "okay": "окей", "ai": "эй ай",
+    "gpt": "джи пи ти", "chatgpt": "чат джи пи ти", "openai": "оупен эй ай", "llm": "эл эл эм",
+    "qwen": "квен", "gemma": "джемма", "llama": "лама", "whisper": "виспер", "vosk": "воск",
+    "silero": "силеро", "kobold": "кобольд", "koboldcpp": "кобольд", "gradio": "градио",
+    "gguf": "джи джи ю эф",
+    # частые английские слова
+    "pro": "про", "max": "макс", "plus": "плюс", "mini": "мини", "ultra": "ультра",
+    "smart": "смарт", "home": "хоум", "the": "зе", "and": "энд", "of": "оф", "for": "фор",
+    "game": "гейм", "gaming": "гейминг", "stream": "стрим", "update": "апдейт",
+    "server": "сервер", "browser": "браузер", "file": "файл",
+}
+LETTER_NAMES = {"a": "эй", "b": "би", "c": "си", "d": "ди", "e": "и", "f": "эф", "g": "джи",
+                "h": "эйч", "i": "ай", "j": "джей", "k": "кей", "l": "эл", "m": "эм", "n": "эн",
+                "o": "оу", "p": "пи", "q": "кью", "r": "ар", "s": "эс", "t": "ти", "u": "ю",
+                "v": "ви", "w": "дабл ю", "x": "икс", "y": "уай", "z": "зед"}
+_TR_MULTI = [("tion", "шн"), ("igh", "ай"), ("sch", "ск"), ("tch", "ч"), ("sh", "ш"),
+             ("ch", "ч"), ("th", "т"), ("ph", "ф"), ("ck", "к"), ("qu", "кв"), ("wh", "в"),
+             ("kn", "н"), ("oo", "у"), ("ee", "и"), ("ea", "и"), ("ou", "ау"), ("ow", "оу"),
+             ("ay", "эй"), ("ai", "эй"), ("ey", "эй"), ("oy", "ой")]
+_TR_ONE = {"a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф", "g": "г", "h": "х",
+           "i": "и", "j": "дж", "k": "к", "l": "л", "m": "м", "n": "н", "o": "о", "p": "п",
+           "q": "к", "r": "р", "s": "с", "t": "т", "u": "у", "v": "в", "w": "в", "x": "кс",
+           "y": "и", "z": "з"}
+
+
+def _translit(word):
+    """Незнакомое английское слово -> примерное чтение кириллицей."""
+    w = word.lower()
+    if len(w) > 3 and w.endswith("e") and w[-2] not in "aeiouy":
+        w = w[:-1]  # немая e: phone -> фон
+    out, i = [], 0
+    while i < len(w):
+        for src, dst in _TR_MULTI:
+            if w.startswith(src, i):
+                out.append(dst)
+                i += len(src)
+                break
+        else:
+            ch, nxt = w[i], w[i + 1:i + 2]
+            if ch == "c" and nxt in ("e", "i", "y"):
+                out.append("с")
+            elif ch == "e" and i == 0:
+                out.append("э")
+            elif ch == "y" and i == 0 and nxt in tuple("aeiou"):
+                out.append("й")
+            else:
+                out.append(_TR_ONE.get(ch, ""))
+            i += 1
+    return "".join(out)
+
+
+def latin_to_ru(text):
+    """«MIDI-синтезатор на Windows» -> «миди-синтезатор на виндоус»."""
+    text = re.sub(r"\b[Cc]\+\+", " си плюс плюс ", text)
+    text = re.sub(r"\b[Cc]#", " си шарп ", text)
+
+    def word(p):
+        low = p.lower()
+        if low in LATIN_WORDS:
+            return LATIN_WORDS[low]
+        if len(p) == 1 or (p.isupper() and len(p) <= 5):  # аббревиатура: VST, GPU
+            return " ".join(LETTER_NAMES[c] for c in low)
+        return _translit(p)
+
+    def repl(m):
+        tok = m.group(0)
+        if tok.lower() in LATIN_WORDS:
+            return LATIN_WORDS[tok.lower()]
+        return " ".join(word(p) for p in re.split(r"[-']", tok) if p)
+
+    return re.sub(r"[A-Za-z]+(?:['-][A-Za-z]+)*", repl, text)
+
+
+def _plural(n, one, few, many):
+    n = abs(int(n)) % 100
+    if 11 <= n <= 19:
+        return many
+    n %= 10
+    return one if n == 1 else few if 2 <= n <= 4 else many
+
+
+def _num_words(s, to="cardinal"):
+    try:
+        from num2words import num2words
+    except ImportError:
+        return s
+    try:
+        if re.fullmatch(r"\d+", s):
+            return num2words(int(s), lang="ru", to=to)
+        return num2words(float(s.replace(",", ".")), lang="ru")
+    except Exception:
+        return s
+
+
+def _ordinal_case(words, case):
+    """«двадцать четвёртый» -> «двадцать четвёртом» (о годе) / «двадцать четвёртого»."""
+    *head, last = words.split()
+    if last.endswith("ий"):
+        last = last[:-2] + ("ьем" if case == "prep" else "ьего")
+    elif last.endswith(("ый", "ой")):
+        last = last[:-2] + ("ом" if case == "prep" else "ого")
+    return " ".join(head + [last])
+
+
+def numbers_to_ru(text):
+    """Цифры -> слова: «в 2024 году», «50%», «3,5»."""
+    text = re.sub(r"(?<=\d)[ \u00a0\u202f](?=\d{3}\b)", "", text)  # 1 000 000
+    text = re.sub(r"(?<=\d)\s*\+\s*(?=\d)", " плюс ", text)     # «+» у Silero — знак ударения
+    text = re.sub(r"(?<=\d)\s*=\s*(?=\d)", " равно ", text)
+
+    def year(m):
+        w = _num_words(m.group(1), to="ordinal")
+        if w == m.group(1):
+            return m.group(0)
+        g = m.group(2).lower()
+        w = _ordinal_case(w, "prep") if g == "году" else _ordinal_case(w, "gen") if g == "года" else w
+        return f"{w} {m.group(2)}"
+
+    def pct(m):
+        num = m.group(1)
+        unit = "процента" if re.search(r"[.,]", num) else \
+            _plural(num, "процент", "процента", "процентов")
+        return f"{_num_words(num)} {unit}"
+
+    text = re.sub(r"\b(1\d{3}|20\d{2})\s*(году|года|год)\b", year, text)  # годы, не «2 года»
+    text = re.sub(r"(\d+(?:[.,]\d+)?)\s*%", pct, text)
+    return re.sub(r"\d+(?:[.,]\d+)?", lambda m: f" {_num_words(m.group(0))} ", text)
+
+
 def clean_for_tts(text):
     text = re.sub(r"https?://\S+", "ссылка", text)
     text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
+    text = latin_to_ru(numbers_to_ru(text))  # до чистки markdown: иначе «C#» теряет «#»
     text = re.sub(r"[*_#`>~|]", " ", text)
     # эмодзи и прочие символы вне алфавита/пунктуации — TTS их не читает корректно
     text = re.sub(r"[^\w\s.,!?…:;+%№«»()\-—–'\"]", " ", text, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+([.,!?…:;])", r"\1", re.sub(r"\s+", " ", text)).strip()
 
 
 def split_long(text, maxlen=350):
@@ -318,11 +1080,13 @@ def speak(text, voice):
     pause = np.zeros(int(SAMPLE_RATE_TTS * 0.25), dtype=np.float32)
     pieces = []
     for chunk in split_long(clean_for_tts(text)):
+        if not re.search(r"[а-яё]", chunk, re.I):
+            continue  # Silero падает на тексте без единой буквы
         audio = model.apply_tts(text=chunk, speaker=voice, sample_rate=SAMPLE_RATE_TTS)
         arr = audio.numpy() if torch.is_tensor(audio) else np.asarray(audio)
         pieces.append(np.asarray(arr, dtype=np.float32).flatten())
         pieces.append(pause.copy())
-    full = np.concatenate(pieces)
+    full = np.concatenate(pieces) if pieces else pause
     out = os.path.join(tempfile.gettempdir(), "ru_assistant_reply.wav")
     sf.write(out, full, SAMPLE_RATE_TTS)
     return out
@@ -352,11 +1116,14 @@ def answer_and_speak(user_text, cfg):
 # была пауза (тогда звучит сигнал «слушаю»). Конец фразы определяет сам Vosk по
 # паузе (endpointing), а не порог громкости: фиксированный порог RMS ломался от
 # шума вентилятора — вопрос «не заканчивался» по 30 секунд.
+# Vosk знает только русский словарь («MIDI» у него превращается в «видео»), поэтому
+# звук самой фразы (по времени слов от Vosk) отдаётся Whisper — он и даёт текст вопроса.
 
 QUESTION_TIMEOUT = 8.0   # сек ждать вопрос после одиночного wake word
 SILENT_DB = -75.0        # тише — микрофон фактически отдаёт нули
+RING_SEC = 45.0          # сколько секунд звука помнить для Whisper
 WAKE_STATE = {"phase": "off", "level": -90.0, "heard": "", "info": "", "warn": "",
-              "note": "", "device": "", "wake": "", "silent": False}
+              "note": "", "stt_warn": "", "device": "", "wake": "", "silent": False}
 _wake = {"thread": None, "stop": None, "gen": 0, "cfg": dict(DEFAULT_SETTINGS)}
 MUTE_UNTIL = [0.0]  # до этого времени браузер озвучивает ответ — микрофон не слушаем
 
@@ -399,6 +1166,16 @@ def find_wake(words, phrases):
     return None
 
 
+def strip_wake_text(text, phrases, max_pos=2):
+    """«Ассистент, как настроить MIDI?» -> «как настроить MIDI?» (wake word — в начале)."""
+    toks = list(re.finditer(r"\w+", text or ""))
+    longest = max(len(p) for p in phrases)
+    pos = find_wake([m.group(0) for m in toks[:max_pos + longest]], phrases)
+    if pos is None or pos[0] > max_pos:
+        return (text or "").strip()
+    return re.sub(r"^[\s,.!?:;—–\-]+", "", text[toks[pos[1] - 1].end():]).strip()
+
+
 def missing_wake_words(model, phrases):
     """Слова, которых нет в словаре модели Vosk, — их она не услышит никогда."""
     finder = getattr(model, "vosk_model_find_word", None)
@@ -425,26 +1202,60 @@ def make_beep(sr=SAMPLE_RATE_TTS):
 
 
 def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
-              flush=lambda: None, stop=lambda: False, report=None, muted=lambda: False):
+              flush=lambda: None, stop=lambda: False, report=None, muted=lambda: False,
+              refine=None):
     """Ядро wake word; тестируется без микрофона.
     read_frame() -> bytes (int16 mono, частота sr) | b"" (пока пусто) | None (стоп).
     process(question) — LLM + TTS + проигрывание; блокирует (себя в это время не слушаем).
     get_cfg() -> текущие настройки: wake word можно менять на лету.
     report(**поля) — обновление состояния для GUI.
-    muted() -> True, пока ответ звучит из браузера (иначе ассистент услышит сам себя)."""
+    muted() -> True, пока ответ звучит из браузера (иначе ассистент услышит сам себя).
+    refine(pcm, sr) -> текст той же фразы от Whisper ("" — оставить текст Vosk)."""
     report = report or (lambda **kv: WAKE_STATE.update(kv))
     model = load_stt()
 
     def new_rec():
-        return vosk.KaldiRecognizer(model, sr)  # Vosk сам приведёт частоту к 16 кГц
+        r = vosk.KaldiRecognizer(model, sr)  # Vosk сам приведёт частоту к 16 кГц
+        r.SetWords(True)  # время каждого слова — чтобы вырезать фразу для Whisper
+        return r
 
     rec = new_rec()
     t = 0.0               # сколько секунд аудио обработано
+    rec_t0 = 0.0          # с какого момента слушает текущий распознаватель (время слов Vosk — от него)
+    ring = collections.deque()  # (начало, сэмплы) — последние RING_SEC секунд звука
     level = -90.0
     loud_at = 0.0         # когда последний раз с микрофона шли не нули
     raw_wake, phrases = None, []
     pending_until = None  # был одиночный wake word — ждём вопрос до этого момента
     was_muted = False
+
+    def ring_slice(a, b):
+        parts = []
+        for t_start, smp in ring:
+            t_end = t_start + smp.size / sr
+            if t_end <= a or t_start >= b:
+                continue
+            parts.append(smp[max(0, int((a - t_start) * sr)):int(math.ceil((b - t_start) * sr))])
+        return np.concatenate(parts) if parts else np.zeros(0, np.int16)
+
+    def improve(question, winfo, first_word):
+        """Текст вопроса от Whisper по звуку этой фразы; при сбое — текст Vosk."""
+        if refine is None or not winfo:
+            return question
+        a = rec_t0 + winfo[first_word]["start"] - 0.3
+        b = rec_t0 + winfo[-1]["end"] + 0.4
+        try:
+            better = refine(ring_slice(a, b), sr)
+        except Exception as e:
+            report(stt_warn=f"Whisper не сработал ({e}) — вопрос распознан Vosk.")
+            print(f"[wake] Whisper не сработал: {e}", flush=True)
+            return question
+        report(stt_warn="")
+        better = strip_wake_text(better, phrases) if better else ""
+        if better:
+            print(f"[wake] Vosk: «{question}» → Whisper: «{better}»", flush=True)
+        return better or question
+
     report(phase="waiting", heard="", info="")
     while not stop():
         fr = read_frame()
@@ -457,7 +1268,7 @@ def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
             continue
         if was_muted:  # после озвучки — с чистого листа
             was_muted = False
-            rec = new_rec()
+            rec, rec_t0 = new_rec(), t
         cur = (get_cfg().get("wake_word") or "").strip() or "ассистент"
         if cur != raw_wake:
             raw_wake, phrases = cur, parse_wake_words(cur)
@@ -467,7 +1278,10 @@ def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
                          + " нет в словаре модели — она их не распознает, выберите другое wake word."
                          ) if miss else "")
         samples = np.frombuffer(fr, dtype=np.int16)
+        ring.append((t, samples))
         t += samples.size / sr
+        while ring and ring[0][0] < t - RING_SEC:
+            ring.popleft()
         rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2))) if samples.size else 0.0
         db = 20 * math.log10(max(rms, 1.0) / 32768.0)
         level = max(db, level - 2.0)  # индикатор: быстрая атака, плавный спад
@@ -477,15 +1291,19 @@ def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
 
         partial = ""
         if rec.AcceptWaveform(fr):
-            text = json.loads(rec.Result()).get("text", "").strip()
-            question = None
+            res = json.loads(rec.Result())
+            text = res.get("text", "").strip()
+            winfo = res.get("result") or []
+            question, first_word = None, 0
             if text:
                 report(heard=text)
                 print(f"[wake] слышу: {text}", flush=True)
                 words = text.split()
+                if len(winfo) != len(words):
+                    winfo = []
                 pos = find_wake(words, phrases)
                 if pos is not None:
-                    question = " ".join(words[pos[1]:])
+                    question, first_word = " ".join(words[pos[1]:]), pos[0]
                     if not question:  # только wake word: сигнал и ждём вопрос
                         pending_until = t + QUESTION_TIMEOUT
                         report(phase="listening", info="")
@@ -498,6 +1316,7 @@ def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
                     question = text
             if question:
                 pending_until = None
+                question = improve(question, winfo, first_word)
                 report(phase="thinking", info=f"Вопрос: «{question}»")
                 try:
                     process(question)
@@ -506,7 +1325,8 @@ def wake_loop(read_frame, sr, process, get_cfg, beep=lambda: None,
                     report(info=f"Ошибка ответа: {e}")
                     print(f"[wake] ошибка ответа: {e}", flush=True)
                 flush()               # выкинуть всё, что микрофон слышал во время ответа (эхо)
-                rec = new_rec()
+                rec, rec_t0 = new_rec(), t
+                ring.clear()
                 report(phase="waiting", heard="")
                 continue
             if pending_until is None:
@@ -585,7 +1405,8 @@ def _wake_main(gen, stop_ev):
     def get_cfg():
         return _wake["cfg"]
 
-    report(phase="starting", info="", warn="", note="", heard="", device="", silent=False)
+    report(phase="starting", info="", warn="", note="", stt_warn="", heard="", device="",
+           silent=False)
     try:
         import sounddevice as sd
     except Exception as e:
@@ -633,6 +1454,13 @@ def _wake_main(gen, stop_ev):
         except Exception:
             pass
 
+    def refine(pcm, pcm_sr):
+        cfg = get_cfg()
+        if cfg.get("stt_engine") != STT_WHISPER:
+            return ""
+        report(phase="recognizing", info="")
+        return whisper_pcm(resample_int16(pcm, pcm_sr), cfg)
+
     def process(question):
         answer, wav = answer_and_speak(question, get_cfg())
         report(phase="speaking", info=f"Ответ: «{answer[:150]}»")
@@ -648,7 +1476,7 @@ def _wake_main(gen, stop_ev):
                    note=note)
             wake_loop(read_frame, sr, process, get_cfg, beep=beep, flush=flush,
                       stop=stop_ev.is_set, report=report,
-                      muted=lambda: time.time() < MUTE_UNTIL[0])
+                      muted=lambda: time.time() < MUTE_UNTIL[0], refine=refine)
     except Exception as e:
         report(phase="error", info=f"Ошибка микрофона: {e}")
 
@@ -679,6 +1507,7 @@ PHASE_TEXT = {
     "starting": "⏳ Запускаю микрофон и распознавание…",
     "waiting": "🟢 Жду wake word {wake}",
     "listening": "🟡 Слушаю вопрос…",
+    "recognizing": "✍️ Распознаю вопрос (Whisper)…",
     "thinking": "🧠 Думаю…",
     "speaking": "🔊 Отвечаю…",
     "error": "🔴 Wake word не работает",
@@ -699,7 +1528,7 @@ def render_wake_status():
         lines.append(f"Уровень: `{'█' * n}{'░' * (20 - n)}` {lvl:.0f} дБ")
         if st.get("heard"):
             lines.append(f"Слышу: «{st['heard'][-100:]}»")
-    for key in ("note", "warn"):
+    for key in ("note", "warn", "stt_warn"):
         if st.get(key):
             lines.append("⚠️ " + st[key])
     if st.get("silent") and phase in ("waiting", "listening"):
@@ -712,16 +1541,64 @@ def render_wake_status():
     return "  \n".join(lines)
 
 
+ENGINE_PHASE_TEXT = {
+    "off": "⚪ не запущен — запустится сам при первом вопросе",
+    "download": "⏬ скачиваю…",
+    "starting": "⏳ запускается…",
+    "ready": "🟢 работает",
+    "error": "🔴 ошибка",
+}
+
+
+def render_engine_status(cfg=None):
+    cfg = cfg or _wake["cfg"]
+    st = dict(ENGINE_STATE)
+    phase = st.get("phase", "off")
+    if not any(engine_needs(cfg)) and phase in ("off", "error"):
+        return ("**⚙️ Локальный движок не нужен:** ответы — через LiteLLM, "
+                "вопрос распознаёт Vosk.")
+    lines = ["**⚙️ Движок KoboldCpp: " + ENGINE_PHASE_TEXT.get(phase, phase) + "**"]
+    if st.get("device"):
+        lines.append("🖥 Считает: " + st["device"])
+    if st.get("models"):
+        lines.append("📦 " + st["models"])
+    speed = []
+    if st.get("stt_sec") is not None:
+        speed.append(f"Whisper {st['stt_sec']:.1f} с")
+    if st.get("llm_sec") is not None:
+        speed.append(f"LLM {st['llm_sec']:.1f} с"
+                     + (f" ({st['llm_tps']:.0f} ток/с)" if st.get("llm_tps") else ""))
+    if speed:
+        lines.append("⏱ Последний вопрос: " + " · ".join(speed))
+    try:
+        changed = phase == "ready" and _eng["light"] is not None \
+            and engine_light_key(cfg) != _eng["light"]
+    except Exception:
+        changed = False
+    if changed:
+        lines.append("⚠️ Настройки движка изменены — применятся при следующем вопросе "
+                     "(или нажмите «Перезапустить движок»).")
+    if st.get("warn"):
+        lines.append("⚠️ " + st["warn"])
+    if st.get("info"):
+        lines.append(st["info"])
+    return "  \n".join(lines)
+
+
 # ----------------------------- UI-обработчики --------------------------------
 
 SETTING_FIELDS = ["voice", "llm_source", "hf_repo", "hf_file", "local_gguf_path",
                   "litellm_base", "litellm_key", "litellm_model", "n_ctx",
-                  "wake_word", "wake_enabled", "wake_device"]
+                  "wake_word", "wake_enabled", "wake_device",
+                  "stt_engine", "compute", "whisper_model", "whisper_prompt", "gpu_layers"]
 
 
 def make_cfg(*values):
     cfg = dict(DEFAULT_SETTINGS)
+    # ключи без полей в GUI (kobold_path) — из текущих настроек
+    cfg.update({k: v for k, v in _wake["cfg"].items() if k not in SETTING_FIELDS})
     cfg.update(zip(SETTING_FIELDS, values))
+    cfg["gpu_layers"] = _int(cfg.get("gpu_layers"), -1)
     return cfg
 
 
@@ -740,11 +1617,11 @@ def respond(audio_path, text_input, *cfg_values, progress=gr.Progress()):
         if not user_text:
             if not audio_path:
                 return None, "Запишите голос или напишите текст.", ""
-            progress(0.1, desc="Распознаю речь (первый раз скачается ~45 МБ)...")
-            user_text = transcribe(audio_path)
+            progress(0.1, desc="Распознаю речь…")
+            user_text = transcribe(audio_path, cfg)
         if not user_text:
             return None, "Ничего не расслышал — попробуйте ещё раз.", ""
-        progress(0.35, desc="Думаю (первый запуск скачает модель, это долго)...")
+        progress(0.35, desc="Думаю (первый запуск скачает модели — статус движка выше)…")
         answer, wav = answer_and_speak(user_text, cfg)
         # ответ сейчас зазвучит из браузера — wake word не должен слушать сам себя
         MUTE_UNTIL[0] = time.time() + sf.info(wav).duration + 1.5
@@ -770,6 +1647,17 @@ def on_device_change(*cfg_values):
     return render_wake_status()
 
 
+def on_engine_setting(*cfg_values):
+    """Режим/распознавание/видеокарта/модель Whisper сменились — движок подстроится фоном."""
+    apply_settings(*cfg_values)
+    engine_bg()
+
+
+def on_restart_engine(*cfg_values):
+    apply_settings(*cfg_values)
+    engine_bg(restart=True)
+
+
 def refresh_devices():
     t = _wake["thread"]
     if not (t and t.is_alive()):
@@ -783,13 +1671,14 @@ def refresh_devices():
 
 
 def poll_ui(seen):
-    """Таймер: живой статус wake word + диалог, если он изменился."""
+    """Таймер: живой статус wake word и движка + диалог, если он изменился."""
     seen = seen or {}
-    status, ver = render_wake_status(), HISTORY_VER[0]
+    status, ver, eng = render_wake_status(), HISTORY_VER[0], render_engine_status()
     return (
         status if status != seen.get("status") else gr.skip(),
         render_log() if ver != seen.get("ver") else gr.skip(),
-        {"status": status, "ver": ver},
+        eng if eng != seen.get("eng") else gr.skip(),
+        {"status": status, "ver": ver, "eng": eng},
     )
 
 
@@ -811,15 +1700,24 @@ def build_ui():
     devices = list_input_devices()
     if s["wake_device"] not in devices:
         devices.append(s["wake_device"])
+    whisper_choices = list(WHISPER_MODELS)
+    if s["whisper_model"] not in whisper_choices:
+        whisper_choices.append(s["whisper_model"])
     with gr.Blocks(title="RU Voice Assistant") as demo:
         gr.Markdown(
             "# 🎙️ RU Voice Assistant\n"
-            "Микрофон → Vosk → LLM → Silero. Настройки сохраняются автоматически "
+            "Микрофон → Whisper / Vosk → LLM → Silero. Настройки сохраняются автоматически "
             "в `settings.json` рядом с программой."
         )
         mode = gr.Radio([SRC_HF, SRC_LOCAL, SRC_LITELLM],
                         value=s["llm_source"], label="Движок ответов")
-        with gr.Accordion("Настройки модели", open=False):
+        with gr.Row():
+            stt = gr.Radio([STT_WHISPER, STT_VOSK], value=s["stt_engine"],
+                           label="Распознавание вопроса")
+            compute = gr.Radio([COMPUTE_GPU, COMPUTE_CPU], value=s["compute"],
+                               label="Где считать LLM и Whisper")
+        engine_status = gr.Markdown(render_engine_status(s))
+        with gr.Accordion("Настройки моделей", open=False):
             with gr.Row():
                 hf_repo = gr.Textbox(label="HF репозиторий", value=s["hf_repo"],
                                      placeholder="например, bartowski/...-GGUF")
@@ -831,11 +1729,25 @@ def build_ui():
                 n_ctx = gr.Slider(2048, 16384, value=int(s["n_ctx"]), step=1024,
                                   label="Контекст (токенов)")
             with gr.Row():
+                whisper_model = gr.Dropdown(
+                    whisper_choices, value=s["whisper_model"], allow_custom_value=True,
+                    label="Модель Whisper (из ggerganov/whisper.cpp или путь к .bin)",
+                    info="large-v3-turbo — для видеокарты; на процессоре быстрее "
+                         "ggml-small-q8_0.bin, но английские слова она узнаёт хуже")
+                gpu_layers = gr.Number(value=s["gpu_layers"], precision=0,
+                                       label="Слоёв LLM на видеокарте",
+                                       info="−1 = авто (сколько влезет в видеопамять), "
+                                            "0 = LLM на процессоре")
+            whisper_prompt = gr.Textbox(
+                label="Подсказка для Whisper — термины, которые вы часто говорите",
+                value=s["whisper_prompt"], lines=2)
+            with gr.Row():
                 base_url = gr.Textbox(label="LiteLLM Base URL", value=s["litellm_base"])
                 api_key = gr.Textbox(label="LiteLLM API key", type="password",
                                      value=s["litellm_key"])
                 model_name = gr.Textbox(label="LiteLLM модель", value=s["litellm_model"],
                                         placeholder="например, gpt-4o-mini")
+            restart = gr.Button("🔄 Перезапустить движок")
         with gr.Row():
             audio = gr.Audio(sources=["microphone"], type="filepath",
                              label="🎤 Голосовой вопрос")
@@ -863,22 +1775,28 @@ def build_ui():
         seen = gr.State({})
 
         cfg_inputs = [voice, mode, hf_repo, hf_file, local_gguf, base_url, api_key,
-                      model_name, n_ctx, wake_word, wake_enabled, wake_device]
+                      model_name, n_ctx, wake_word, wake_enabled, wake_device,
+                      stt, compute, whisper_model, whisper_prompt, gpu_layers]
         respond_inputs = [audio, text_input] + cfg_inputs
         respond_outputs = [reply, log, text_input]
+        engine_controls = (mode, stt, compute, whisper_model)
 
         text_input.submit(respond, inputs=respond_inputs, outputs=respond_outputs)
         audio.stop_recording(respond, inputs=respond_inputs, outputs=respond_outputs)
         wake_enabled.change(on_wake_toggle, inputs=cfg_inputs, outputs=[wake_status])
         wake_device.change(on_device_change, inputs=cfg_inputs, outputs=[wake_status])
         refresh.click(refresh_devices, outputs=[wake_device])
+        for comp in engine_controls:
+            comp.change(on_engine_setting, inputs=cfg_inputs, outputs=[])
+        n_ctx.release(on_engine_setting, inputs=cfg_inputs, outputs=[])
+        restart.click(on_restart_engine, inputs=cfg_inputs, outputs=[])
         for comp in cfg_inputs:
-            if comp not in (wake_enabled, wake_device):
+            if comp not in (wake_enabled, wake_device) + engine_controls:
                 comp.change(autosave, inputs=cfg_inputs, outputs=[])
         clear.click(clear_history, outputs=[log])
 
         timer = gr.Timer(0.5)
-        timer.tick(poll_ui, inputs=[seen], outputs=[wake_status, log, seen],
+        timer.tick(poll_ui, inputs=[seen], outputs=[wake_status, log, engine_status, seen],
                    show_progress="hidden")
     return demo
 
@@ -886,7 +1804,16 @@ def build_ui():
 if __name__ == "__main__":
     settings = load_settings()
     _wake["cfg"] = settings
+    atexit.register(_stop_engine_at_exit)
+    if os.name != "nt":  # закрыли терминал или kill — atexit всё равно погасит KoboldCpp
+        import signal as _signal  # (имя signal занято scipy.signal)
+
+        def _exit_on_signal(*_):
+            raise SystemExit(0)
+        for _s in (_signal.SIGTERM, _signal.SIGHUP):
+            _signal.signal(_s, _exit_on_signal)
     app = build_ui()
     if settings.get("wake_enabled"):
         start_wake()
+    engine_bg()  # заранее поднять KoboldCpp — первый вопрос не будет ждать загрузки моделей
     app.launch(inbrowser=True, server_name="127.0.0.1", server_port=7861)

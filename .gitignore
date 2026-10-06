@@ -5,6 +5,8 @@ __pycache__/
 *.pyo
 .installed
 .installed-v2
+.installed-v3
 settings.json
+engine/
 *.wav
 .DS_Store

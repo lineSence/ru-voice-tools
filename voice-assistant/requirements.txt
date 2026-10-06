@@ -5,7 +5,7 @@ soundfile
 numpy
 scipy
 vosk
-llama-cpp-python
+num2words
 huggingface_hub
 requests
 sounddevice
