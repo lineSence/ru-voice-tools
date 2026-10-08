@@ -40,6 +40,12 @@ triggers:
     keywords: [gradio, gui, интерфейс, 7860, 7861, 502, прокси, vpn, localhost]
     load:
       - wiki/rules/ui-gradio.md
+  - id: pc
+    keywords: [управление компьютером, команда, фильм, кино, vlc, плеер, полный экран, пауза, перемотка,
+               громкость, запусти программу, ярлык, пуск, выключи компьютер, pc_control, 7862]
+    load:
+      - wiki/rules/pc-control.md
+      - wiki/architecture/overview.md
   - id: packaging
     keywords: [launch, bat, sh, venv, pip, torch, релиз, zip, установка, winget]
     load:

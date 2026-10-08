@@ -16,6 +16,8 @@ TTS          : Silero v5; английские слова и числа пере
 Промпт       : системный промпт и длина ответа редактируются в GUI
 Wake word    : Vosk слушает микрофон компьютера и ищет слово-триггер, сам вопрос
                дораспознаёт Whisper
+Компьютер    : «включи Бегущий по лезвию» — фильм в VLC на полный экран, «пауза», «громче»,
+               «запусти телеграм», «заблокируй компьютер» (pc_control.py, без LLM)
 
 Настройки автосохраняются в settings.json.
 """
@@ -57,6 +59,8 @@ import torch
 import gradio as gr
 import requests
 import vosk
+
+import pc_control
 
 SAMPLE_RATE_TTS = 48000
 SAMPLE_RATE_STT = 16000
@@ -140,6 +144,10 @@ DEFAULT_SETTINGS = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "max_tokens": DEFAULT_MAX_TOKENS,
     "web_search": WEB_AUTO,
+    "pc_control": True,   # голосовые команды компьютеру (pc_control.py)
+    "movies_dir": "",
+    "vlc_path": "",       # пусто — найти VLC самому (реестр, Program Files, PATH)
+    "pc_aliases": "",     # «как говорю = что открыть», по строке
     "settings_rev": SETTINGS_REV,
 }
 
@@ -1890,6 +1898,33 @@ class SpeechStream:
 
 # ----------------------------- Общий пайплайн --------------------------------
 
+def llm_short(cfg, prompt, max_tokens=60):
+    """Короткий служебный вопрос модели (оригинальное название фильма) — без истории."""
+    msgs = [{"role": "system", "content": "Отвечай одной короткой строкой, без пояснений."},
+            {"role": "user", "content": prompt}]
+    return strip_think("".join(stream_text(cfg, msgs, max_tokens))).strip()
+
+
+def run_pc_command(user_text, cmd, speech, cfg):
+    """Команда компьютеру (pc_control.Reply): действие до озвучки, короткий ответ голосом,
+    действие после (фильм стартует, когда ассистент договорил) -> (ответ, WAV)."""
+    err = pc_control.run(cmd.before)
+    text = err or cmd.text
+    speech.feed(text)
+    live_update(text=text, status="")
+    wav = speech.finish()
+    if not err:
+        err = pc_control.run(cmd.after)
+        if err:  # действие после озвучки не удалось — сказать и об этом
+            text = err
+            extra = SpeechStream(cfg["voice"], play=speech.play)
+            extra.feed(err)
+            wav = extra.finish()
+    note = cmd.note + (f"\n   ⚠️ {err}" if err and cmd.note else (f"⚠️ {err}" if err else ""))
+    history_append(user_text, text, note=note)
+    return text, wav
+
+
 def answer_and_speak(user_text, cfg, play=None, on_status=None, on_speaking=None):
     """Вопрос -> (поиск) -> LLM потоком -> Silero по предложениям -> (ответ, WAV).
     Потокобезопасно (общий для GUI и wake word). play(кусок) — сразу в динамики."""
@@ -1908,6 +1943,13 @@ def answer_and_speak(user_text, cfg, play=None, on_status=None, on_speaking=None
                 on_status(text)
 
         try:
+            if cfg.get("pc_control", True):
+                def ask_llm(prompt):
+                    status("🎬 Уточняю у модели название фильма…")
+                    return llm_short(cfg, prompt)
+                cmd = pc_control.handle(user_text, cfg, ask_llm=ask_llm)
+                if cmd is not None:
+                    return run_pc_command(user_text, cmd, speech, cfg)
             answer, sent, note = think_answer(user_text, cfg, emit=emit, status=status)
             if not answer:
                 answer = "Не получилось ответить — попробуйте переформулировать вопрос."
@@ -2216,6 +2258,8 @@ def _wake_main(gen, stop_ev):
         if "phase" in kv and kv["phase"] != WAKE_STATE.get("phase"):
             extra = kv.get("info") or ""
             print(f"[wake] {kv['phase']} {extra}".rstrip(), flush=True)
+        if kv.get("phase") == "waiting":
+            pc_control.PLAYER.unduck()  # снова ждём wake word — фильму прежнюю громкость
         WAKE_STATE.update(kv)
 
     def get_cfg():
@@ -2264,6 +2308,7 @@ def _wake_main(gen, stop_ev):
     beep_wav = make_beep()
 
     def beep():
+        pc_control.PLAYER.duck()  # фильм потише, пока звучит вопрос
         try:
             sd.play(beep_wav, SAMPLE_RATE_TTS)
             sd.wait()
@@ -2288,6 +2333,7 @@ def _wake_main(gen, stop_ev):
             elif text:
                 report(phase="thinking", info=text)
 
+        pc_control.PLAYER.duck()  # фильм потише, пока ассистент отвечает
         # первые предложения звучат, пока модель дописывает остальное
         answer, _ = answer_and_speak(question, get_cfg(), play=play_now, on_status=on_status,
                                      on_speaking=lambda: report(phase="speaking", info=""))
@@ -2419,7 +2465,8 @@ SETTING_FIELDS = ["voice", "llm_source", "hf_repo", "hf_file", "local_gguf_path"
                   "litellm_base", "litellm_key", "litellm_model", "n_ctx",
                   "wake_word", "wake_enabled", "wake_device",
                   "stt_engine", "compute", "whisper_model", "whisper_prompt", "gpu_layers",
-                  "system_prompt", "max_tokens", "web_search"]
+                  "system_prompt", "max_tokens", "web_search",
+                  "pc_control", "movies_dir", "vlc_path", "pc_aliases"]
 
 
 def make_cfg(*values):
@@ -2523,6 +2570,13 @@ def autosave(*cfg_values):
     apply_settings(*cfg_values)
 
 
+def on_pc_refresh(*cfg_values):
+    """Пересканировать папку фильмов и меню «Пуск», показать, что найдено."""
+    cfg = apply_settings(*cfg_values)
+    pc_control.reset_index()
+    return pc_control.summary(cfg)
+
+
 def clear_history():
     with HISTORY_LOCK:
         HISTORY.clear()
@@ -2619,6 +2673,30 @@ def build_ui():
             wake_status = gr.Markdown(render_wake_status())
             gr.Markdown("Скажите одной фразой «Ассистент, какая погода?» — или скажите "
                         "«Ассистент», дождитесь сигнала и задайте вопрос.")
+        with gr.Accordion("🖥 Управление компьютером", open=False):
+            pc_enabled = gr.Checkbox(value=bool(s["pc_control"]),
+                                     label="Выполнять голосовые команды: фильмы, программы, громкость")
+            with gr.Row():
+                movies_dir = gr.Textbox(label="Папка с фильмами", value=s["movies_dir"],
+                                        placeholder=r"D:\Фильмы")
+                vlc_path = gr.Textbox(label="Путь к vlc.exe (пусто — найти автоматически)",
+                                      value=s["vlc_path"],
+                                      placeholder=r"C:\Program Files\VideoLAN\VLC\vlc.exe")
+            pc_aliases = gr.Textbox(
+                label="Свои названия: по одному на строку, «как говорю = что открыть»",
+                value=s["pc_aliases"], lines=3,
+                placeholder="бегущий по лезвию = Blade Runner\nбраузер = "
+                            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                info="Справа — название фильма, путь к видео, программе или ярлыку, адрес сайта.")
+            with gr.Row(equal_height=True):
+                pc_status = gr.Markdown(pc_control.summary(s))
+                pc_refresh = gr.Button("🔄 Обновить списки", size="sm", scale=0)
+            gr.Markdown(
+                "Примеры: «Ассистент, включи Бегущий по лезвию на полный экран», «…пауза», "
+                "«…продолжи», «…перемотай вперёд на 5 минут», «…громче», «…выключи фильм», "
+                "«…запусти телеграм», «…заблокируй компьютер», «…выключи компьютер» "
+                "(переспросит, ответьте «Ассистент, да»). Если похожих фильмов несколько, "
+                "ассистент спросит какой — ответьте «Ассистент, второй» или назовите год.")
         with gr.Row():
             clear = gr.Button("🗑 Сбросить диалог")
         reply = gr.Audio(label="Ответ (озвучка)", type="filepath", autoplay=True)
@@ -2628,7 +2706,8 @@ def build_ui():
         cfg_inputs = [voice, mode, hf_repo, hf_file, local_gguf, base_url, api_key,
                       model_name, n_ctx, wake_word, wake_enabled, wake_device,
                       stt, compute, whisper_model, whisper_prompt, gpu_layers,
-                      system_prompt, max_tokens, web_search]
+                      system_prompt, max_tokens, web_search,
+                      pc_enabled, movies_dir, vlc_path, pc_aliases]
         respond_inputs = [audio, text_input] + cfg_inputs
         respond_outputs = [reply, log, text_input]
         engine_controls = (mode, stt, compute, whisper_model)
@@ -2652,6 +2731,9 @@ def build_ui():
             if comp not in (wake_enabled, wake_device) + engine_controls:
                 comp.change(autosave, inputs=cfg_inputs, outputs=[])
         clear.click(clear_history, outputs=[log])
+        pc_refresh.click(on_pc_refresh, inputs=cfg_inputs, outputs=[pc_status])
+        for comp in (movies_dir, vlc_path):
+            comp.blur(on_pc_refresh, inputs=cfg_inputs, outputs=[pc_status])
 
         timer = gr.Timer(0.5)
         timer.tick(poll_ui, inputs=[seen], outputs=[wake_status, log, engine_status, seen],
